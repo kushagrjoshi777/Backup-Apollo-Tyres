@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Apollo · Tyre Pressure Dashboard</title>
+  <meta name="description" content="Engineering dashboard for XSENSOR tyre contact pressure analysis — Apollo project." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<!-- jsPDF library -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.4.0/jspdf.umd.min.js"></script>
+<script>
+  // Wait for jsPDF to load
+  let jsPDFReady = false;
+  const checkjsPDF = setInterval(() => {
+    if (typeof jsPDF !== 'undefined') {
+      window.jsPDFLib = jsPDF;
+      jsPDFReady = true;
+      clearInterval(checkjsPDF);
+      console.log('jsPDF loaded successfully');
+    }
+  }, 100);
+  
+  setTimeout(() => {
+    if (!jsPDFReady) console.warn('jsPDF library failed to load within timeout');
+  }, 5000);
+</script>
+
+<!-- ══════════════════ HEADER ══════════════════ -->
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="logo-mark">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M12 2L2 22H22L12 2Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+        <path d="M12 6L5 20H19L12 6Z" fill="currentColor"/>
+      </svg>
+    </div>
+    <div>
+      <span class="logo-text">APOLLO TYRES</span>
+      <span class="logo-sub">Pressure Analysis</span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div id="status-pill" class="status-pill">Idle</div>
+    <label class="theme-toggle">
+      <input type="checkbox" id="theme-toggle" />
+      <span class="theme-slider"></span>
+      <span class="theme-label">Dark</span>
+    </label>
+  </div>
+</header>
+
+<!-- ══════════════════ UPLOAD PAGE ══════════════════ -->
+<section id="upload-page" class="page active">
+  <div class="upload-center">
+    <div class="upload-card" id="drop-zone">
+      <div class="upload-icon">
+        <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+      </div>
+      <h1 class="upload-title">XSENSOR Tyre Pressure Analysis</h1>
+      <p class="upload-sub">Upload your tyre pressure CSV file for detailed analysis</p>
+      
+      <!-- Unified Settings -->
+      <div class="upload-settings" onclick="event.stopPropagation()">
+        <div class="setting-group">
+          <div class="setting-label">Configuration</div>
+          <div class="setting-row">
+            <select id="tyre-preset" class="select-control">
+              <option value="tbr-preset">TBR (5–220 PSI)</option>
+              <option value="pcr-preset">PCR (5–100 PSI)</option>
+              <option value="custom">Custom Range</option>
+            </select>
+          </div>
+        </div>
+        
+        <div class="setting-group" id="custom-range-group" style="display:none;">
+          <div class="setting-label">Pressure Range</div>
+          <div class="setting-row">
+            <input type="range" id="min-pressure" min="0" max="100" value="5" class="slider-range" />
+            <span class="value-display" id="min-val">5 PSI</span>
+          </div>
+          <div class="setting-row">
+            <input type="range" id="max-pressure" min="50" max="300" value="220" class="slider-range" />
+            <span class="value-display" id="max-val">220 PSI</span>
+          </div>
+        </div>
+        
+        <div class="setting-group">
+          <div class="setting-label">Vehicle Speed (km/h)</div>
+          <div class="setting-row">
+            <input type="number" id="speed" min="0" max="350" step="1" value="0" class="input-control" />
+          </div>
+        </div>
+      </div>
+
+      <label class="upload-btn" for="file-input">Choose File</label>
+      <input type="file" id="file-input" accept=".csv" hidden />
+      <p class="upload-note">Supports raw and pre-trimmed XSENSOR exports · up to 2 GB</p>
+    </div>
+    <div id="upload-progress" class="progress-wrap hidden">
+      <div class="progress-label" id="progress-label">Uploading…</div>
+      <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-bar"></div></div>
+      <div class="progress-sub" id="progress-sub">0.00s elapsed</div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════ DASHBOARD PAGE ══════════════════ -->
+<section id="dashboard-page" class="page">
+
+  <!-- Toolbar -->
+  <div class="dash-toolbar">
+    <div class="toolbar-left">
+      <span class="badge file-badge" id="file-badge">—</span>
+      <span class="badge type" id="tyre-type-badge">TBR</span>
+    </div>
+    <div class="toolbar-right">
+      <label class="switch-wrap">
+        <input type="checkbox" id="noise-toggle" />
+        <span class="switch-toggle"></span>
+        <span class="switch-label">Noise Filter</span>
+      </label>
+      <button class="ghost-btn" id="export-btn" title="Export results">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10z"/>
+          <polyline points="14 2 14 10 22 10"/>
+        </svg>
+        Export
+      </button>
+      <button class="ghost-btn" id="new-file-btn" title="Upload new file">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 12H5M12 19l-7-7 7-7"/>
+        </svg>
+        New File
+      </button>
+    </div>
+  </div>
+  <div class="dash-summary">
+    <div class="summary-card">
+      <div class="summary-label">Pressure Range</div>
+      <div class="summary-value" id="pressure-meta">5–220 PSI</div>
+    </div>
+    <div class="summary-card">
+      <div class="summary-label">Vehicle Speed</div>
+      <div class="summary-value" id="speed-meta">0 km/h</div>
+    </div>
+  </div>
+
+  <div class="dash-grid">
+
+    <!-- ── PANEL A: Animation ── -->
+    <div class="panel panel-animation">
+      <div class="panel-header">
+        <span class="panel-title">Tyre Animation</span>
+        <span class="panel-tag" id="anim-frame-tag">Frame —</span>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="anim-canvas" width="256" height="256"></canvas>
+        <canvas id="anim-overlay" width="256" height="256" class="canvas-overlay hidden"></canvas>
+      </div>
+      <div class="anim-controls">
+        <button class="ctrl-btn" id="btn-play" title="Play / Pause">
+          <svg id="play-icon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="5,3 19,12 5,21"/>
+          </svg>
+          <svg id="pause-icon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" class="hidden">
+            <rect x="6" y="4" width="4" height="16"/>
+            <rect x="14" y="4" width="4" height="16"/>
+          </svg>
+        </button>
+        <input type="range" id="frame-slider" min="0" max="0" value="0" class="slider" />
+        <span class="ctrl-label mono" id="slider-label">0 / 0</span>
+      </div>
+      <div class="speed-row">
+        <span class="ctrl-label">Speed</span>
+        <input type="range" id="speed-slider" min="1" max="10" value="5" class="slider slim" />
+        <span class="ctrl-label mono" id="speed-label">5×</span>
+      </div>
+    </div>
+
+    <!-- ── PANEL B: Best Frame ── -->
+    <div class="panel panel-best">
+      <div class="panel-header panel-header-with-control">
+        <div>
+          <span class="panel-title">Best Contact Frame</span>
+          <span class="panel-tag" id="best-frame-tag">Frame —</span>
+        </div>
+        <div class="best-frame-control">
+          <input type="number" id="best-frame-input" min="0" class="best-frame-input" placeholder="Frame #" />
+          <button class="ghost-btn small" id="best-frame-btn">Use frame</button>
+        </div>
+      </div>
+      <div class="canvas-wrap canvas-wrap-large">
+        <canvas id="best-canvas" width="256" height="256"></canvas>
+        <canvas id="best-overlay" width="256" height="256" class="canvas-overlay"></canvas>
+      </div>
+    </div>
+
+    <!-- ── PANEL C: Metrics ── -->
+    <div class="panel panel-metrics">
+      <div class="panel-header">
+        <span class="panel-title">Frame Metrics</span>
+      </div>
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Frame Number</div>
+          <div class="metric-value" id="m-frame">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Peak Pressure</div>
+          <div class="metric-value" id="m-peak">—</div>
+          <div class="metric-unit">PSI</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Avg Pressure</div>
+          <div class="metric-value" id="m-avg">—</div>
+          <div class="metric-unit">PSI</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Contact Area</div>
+          <div class="metric-value" id="m-area">—</div>
+          <div class="metric-unit">mm²</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Est. Load</div>
+          <div class="metric-value" id="m-load">—</div>
+          <div class="metric-unit">kg</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Active Sensels</div>
+          <div class="metric-value" id="m-sensels">—</div>
+        </div>
+        <div class="metric-card metric-wide">
+          <div class="metric-label">Contact Coverage</div>
+          <div class="metric-value" id="m-pct">—</div>
+          <div class="metric-unit">%</div>
+          <div class="coverage-bar-bg"><div class="coverage-bar-fill" id="coverage-bar"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── PANEL D: Contact Patch ── -->
+    <div class="panel panel-patch">
+      <div class="panel-header">
+        <span class="panel-title">Contact Patch Analysis</span>
+      </div>
+      <div class="patch-dims">
+        <div class="dim-card">
+          <div class="dim-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M17 12H7M21 12l-4-4M21 12l-4 4M3 12l4-4M3 12l4 4"/>
+            </svg>
+          </div>
+          <div class="dim-label">Width</div>
+          <div class="dim-value" id="p-width">—</div>
+          <div class="dim-unit">mm</div>
+        </div>
+        <div class="dim-card">
+          <div class="dim-icon">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 17V7M12 21l-4-4M12 21l4-4M12 3L8 7M12 3l4 4"/>
+            </svg>
+          </div>
+          <div class="dim-label">Length</div>
+          <div class="dim-value" id="p-length">—</div>
+          <div class="dim-unit">mm</div>
+        </div>
+      </div>
+      <div class="patch-note">Bounding box overlay shown on Best Contact Frame</div>
+      <div class="colorbar-wrap">
+        <div class="colorbar-label">Pressure Scale</div>
+        <canvas id="colorbar-canvas" width="200" height="18"></canvas>
+        <div class="colorbar-ticks">
+          <span id="vmin-label">0</span><span id="vmid-label">110</span><span id="vmax-label">220</span>
+          <span class="tick-unit">PSI</span>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /dash-grid -->
+</section><!-- /dashboard-page -->
+
+<script src="/static/heatmap.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

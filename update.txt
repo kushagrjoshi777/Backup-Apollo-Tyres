@@ -1,0 +1,80 @@
+What we achieved
+
+    Reverse-engineered XSENSOR export format
+    Parsed all frames automatically
+    Reconstructed tyre footprint
+    Generated pressure heatmap
+    Generated frame-by-frame visualization
+
+How to automate for any file
+
+    Instead of hardcoding:
+    file.csv
+
+    Pipeline becomes:
+
+    Load CSV
+    ↓
+    Parse Frames
+    ↓
+    Extract Metadata
+    ↓
+    Generate Heatmaps
+    ↓
+    Calculate Metrics
+    ↓
+    Generate Report
+
+    Any new CSV dropped into a folder can be processed automatically.
+
+Immediate Next Steps
+
+    Metrics Extraction
+
+        Per frame:
+
+        Peak Pressure
+        Average Pressure
+        Contact Area
+        Estimated Load
+        Active Sensels, etc.
+
+        Store into DataFrame.
+
+    Automatic Frame Cutting
+
+    Currently manually cut.
+
+    Can automate:
+    if contact_area > threshold:
+        keep_frame
+
+    Detect:
+
+    Tyre enters
+    Tyre exits
+
+    automatically.
+
+Noise Removal Plan
+
+    Current footprint has small red dots and isolated pixels.
+
+        Method 1 — Pressure Threshold
+        Remove:
+        pressure < 5 PSI
+        already matches XSENSOR threshold.
+
+    Method 2 — Connected Components
+
+        Keep only largest connected footprint.
+        Remove isolated sensor spikes.
+        Very common in pressure mat analysis.
+
+    Method 3 — Morphological Filtering
+
+        Using OpenCV:
+        {opening
+        closing}
+
+        Removes salt-and-pepper noise.
