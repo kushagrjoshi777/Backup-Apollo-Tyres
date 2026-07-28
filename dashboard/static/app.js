@@ -20,7 +20,8 @@ const state = {
   noiseFilterActive: false,
   minPressure: 5,
   maxPressure: 220,
-  speed: 0
+  speed: 0,
+  position: 'FR'
 };
 
 // ──────────────────────────────────────────────────────
@@ -41,12 +42,14 @@ const progressSub = $('progress-sub');
 const statusPill = $('status-pill');
 const fileBadge = $('file-badge');
 const tyreTypeBadge = $('tyre-type-badge');
+const positionBadge = $('position-badge');
 const noiseToggle = $('noise-toggle');
 const themeToggle = $('theme-toggle');
 const newFileBtn = $('new-file-btn');
 const exportBtn = $('export-btn');
 
 const tirePreset = $('tyre-preset');
+const tyrePositionInput = $('tyre-position');
 const minPressureInput = $('min-pressure');
 const maxPressureInput = $('max-pressure');
 const speedInput = $('speed');
@@ -70,6 +73,7 @@ const speedLabel = $('speed-label');
 
 const pressureMeta = $('pressure-meta');
 const speedMeta = $('speed-meta');
+const posMeta = $('pos-meta');
 const bestFrameInput = $('best-frame-input');
 const bestFrameBtn = $('best-frame-btn');
 
@@ -80,7 +84,10 @@ const bestFrameBtn = $('best-frame-btn');
 dropZone.addEventListener('click', () => fileInput.click());
 
 fileInput.addEventListener('change', () => {
-  if (fileInput.files.length) startUpload(fileInput.files[0]);
+  if (fileInput.files.length) {
+    autoDetectFileMetadata(fileInput.files[0]);
+    startUpload(fileInput.files[0]);
+  }
 });
 
 ['dragenter', 'dragover'].forEach(evt =>
@@ -99,8 +106,54 @@ fileInput.addEventListener('change', () => {
 
 dropZone.addEventListener('drop', e => {
   const file = e.dataTransfer.files[0];
-  if (file) startUpload(file);
+  if (file) {
+    autoDetectFileMetadata(file);
+    startUpload(file);
+  }
 });
+
+function autoDetectFileMetadata(file) {
+  const fname = file.name;
+
+  // Detect speed from filename (e.g., 40kmph or 15kmph)
+  const speedMatch = fname.match(/(\d+(?:\.\d+)?)\s*(?:kmph|km\/h|kmh)/i);
+  if (speedMatch && speedMatch[1]) {
+    const spd = parseInt(speedMatch[1], 10);
+    speedInput.value = spd;
+    state.speed = spd;
+  }
+
+  // Detect position from filename (e.g., _FR or FL)
+  const posMatch = fname.match(/\b(FL|FR|RL|RR)\b/i) || fname.match(/[_\-](FL|FR|RL|RR)[_\-\.]/i);
+  if (posMatch && posMatch[1]) {
+    const pos = posMatch[1].toUpperCase();
+    if (tyrePositionInput) tyrePositionInput.value = pos;
+    state.position = pos;
+  }
+
+  // Read first 2000 bytes to check header if needed
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const text = e.target.result;
+    if (!speedMatch) {
+      const headerSpeed = text.match(/(\d+(?:\.\d+)?)\s*(?:kmph|km\/h|kmh)/i);
+      if (headerSpeed && headerSpeed[1]) {
+        const spd = parseInt(headerSpeed[1], 10);
+        speedInput.value = spd;
+        state.speed = spd;
+      }
+    }
+    if (!posMatch) {
+      const headerPos = text.match(/\b(FL|FR|RL|RR)\b/i);
+      if (headerPos && headerPos[1]) {
+        const pos = headerPos[1].toUpperCase();
+        if (tyrePositionInput) tyrePositionInput.value = pos;
+        state.position = pos;
+      }
+    }
+  };
+  reader.readAsText(file.slice(0, 2000));
+}
 
 // Preset handler
 tirePreset.addEventListener('change', () => {
@@ -123,6 +176,12 @@ tirePreset.addEventListener('change', () => {
   }
   updatePressureDisplay();
 });
+
+if (tyrePositionInput) {
+  tyrePositionInput.addEventListener('change', () => {
+    state.position = tyrePositionInput.value;
+  });
+}
 
 minPressureInput.addEventListener('input', () => {
   state.minPressure = parseInt(minPressureInput.value);
@@ -187,12 +246,17 @@ function startUpload(file) {
   showProgressUI();
   setStatus('working', 'Processing');
 
+  const selectedPos = tyrePositionInput ? tyrePositionInput.value : state.position;
+  state.position = selectedPos;
+  state.speed = parseInt(speedInput.value, 10) || 0;
+
   const fd = new FormData();
   fd.append('file', file);
   fd.append('tyre_type', state.minPressure === 5 && state.maxPressure === 100 ? 'PCR' : 'TBR');
   fd.append('min_pressure', state.minPressure);
   fd.append('max_pressure', state.maxPressure);
   fd.append('speed', state.speed);
+  fd.append('position', state.position);
 
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/upload');
@@ -255,6 +319,8 @@ async function loadResult(jobId) {
 
   state.data = data;
   state.selectedFrameNumber = data.best_frame_number;
+  if (data.speed !== undefined) state.speed = data.speed;
+  if (data.position) state.position = data.position;
   setProgress(100, 'Complete', `${data.frame_numbers.length} frames`);
 
   setTimeout(() => {
@@ -271,11 +337,13 @@ function showDashboard(data) {
   uploadPage.classList.remove('active');
   dashPage.classList.add('active');
 
-  const { frame_numbers, vmax, vmin, tyre_type, speed } = data;
+  const { frame_numbers, vmax, vmin, tyre_type, speed, position } = data;
 
   tyreTypeBadge.textContent = tyre_type;
+  if (positionBadge) positionBadge.textContent = position || state.position;
   if (pressureMeta) pressureMeta.textContent = `${vmin}–${vmax} PSI`;
   if (speedMeta) speedMeta.textContent = `${speed} km/h`;
+  if (posMeta) posMeta.textContent = position || state.position;
 
   drawColorbar(colorbarCvs, vmax);
   $('vmin-label').textContent = vmin;
@@ -327,14 +395,13 @@ function showDashboard(data) {
 }
 
 function renderBestFrame() {
-  const { frames, metrics, vmax } = state.data;
+  const { frames, vmax } = state.data;
   const frameNum = state.selectedFrameNumber ?? state.data.best_frame_number;
   const rawFrame = frames[String(frameNum)];
-  const frameIdx = state.data.frame_numbers.indexOf(frameNum);
 
   const analyzed = state.noiseFilterActive
-    ? computeFrameMetrics(applyNoiseFilter(rawFrame), vmax, frameNum)
-    : computeFrameMetrics(rawFrame, vmax, frameNum);
+    ? computeFrameMetrics(applyNoiseFilter(rawFrame), state.data.vmin, vmax, frameNum, state.data.position)
+    : computeFrameMetrics(rawFrame, state.data.vmin, vmax, frameNum, state.data.position);
 
   drawHeatmap(bestCanvas, state.noiseFilterActive ? applyNoiseFilter(rawFrame) : rawFrame);
   drawBbox(bestOverlay, analyzed.contact_patch.bbox);
@@ -387,13 +454,13 @@ function animLoop(ts) {
 }
 
 function updateAnimFrame(idx, updateSlider = true) {
-  const { frame_numbers, frames, metrics, vmax } = state.data;
+  const { frame_numbers, frames, metrics, vmax, vmin, position } = state.data;
   const fn = frame_numbers[idx];
   const rawFrame = frames[String(fn)];
 
   if (state.noiseFilterActive) {
     const filtered = applyNoiseFilter(rawFrame);
-    const analyzed = computeFrameMetrics(filtered, vmax, fn);
+    const analyzed = computeFrameMetrics(filtered, vmin, vmax, fn, position);
     drawHeatmap(animCanvas, filtered);
     updateMetrics(analyzed.metrics);
   } else {
@@ -404,19 +471,36 @@ function updateAnimFrame(idx, updateSlider = true) {
   }
 
   $('anim-frame-tag').textContent = `Frame ${fn}`;
-  sliderLabel.textContent = `${idx + 1} / ${frame_numbers.length}`;
+  sliderLabel.textContent = `Frame ${fn} (${idx + 1}/${frame_numbers.length})`;
   if (updateSlider) $('frame-slider').value = idx;
 }
 
 function updateMetrics(m) {
-  $('m-frame').textContent = m.frame_number;
-  $('m-peak').textContent = m.peak_pressure_psi;
-  $('m-avg').textContent = m.avg_pressure_psi;
-  $('m-area').textContent = m.contact_area_mm2.toLocaleString();
-  $('m-load').textContent = m.estimated_load_kg.toLocaleString();
-  $('m-sensels').textContent = m.active_sensels.toLocaleString();
-  $('m-pct').textContent = m.contact_pct;
-  $('coverage-bar').style.width = `${Math.min(m.contact_pct, 100)}%`;
+  const setEl = (id, val) => {
+    const el = $(id);
+    if (el) el.textContent = val !== undefined && val !== null ? val : '—';
+  };
+
+  setEl('m-area', m.contact_area_mm2 ? m.contact_area_mm2.toLocaleString() : '—');
+  setEl('m-ratio', m.contact_ratio_pct);
+  setEl('m-fp-w', m.fp_width_mm);
+  setEl('m-fp-l', m.fp_length_mm);
+  setEl('m-s1', m.outer_shoulder_s1_mm);
+  setEl('m-s2', m.inner_shoulder_s2_mm);
+  setEl('m-skew', m.shoulder_skewness_pct);
+  setEl('m-sq-ratio', m.squareness_s1_s2_pct);
+  setEl('m-sq-avg', m.squareness_avg);
+  setEl('m-ls-ratio', m.land_sea_ratio);
+  setEl('m-avg', m.contact_pressure_psi || m.avg_pressure_psi);
+  setEl('m-max-l', m.maximum_length_mm);
+  setEl('m-max-w', m.maximum_width_mm);
+
+  setEl('m-frame', m.frame_number);
+  setEl('m-peak', m.peak_pressure_psi);
+  setEl('m-load', m.estimated_load_kg ? m.estimated_load_kg.toLocaleString() : '—');
+
+  const covBar = $('coverage-bar');
+  if (covBar) covBar.style.width = `${Math.min(m.contact_pct || 0, 100)}%`;
 }
 
 // ──────────────────────────────────────────────────────

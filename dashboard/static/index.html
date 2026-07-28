@@ -94,6 +94,18 @@
         </div>
         
         <div class="setting-group">
+          <div class="setting-label">Tyre Position</div>
+          <div class="setting-row">
+            <select id="tyre-position" class="select-control">
+              <option value="FR">FR (Front Right)</option>
+              <option value="FL">FL (Front Left)</option>
+              <option value="RR">RR (Rear Right)</option>
+              <option value="RL">RL (Rear Left)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="setting-group">
           <div class="setting-label">Vehicle Speed (km/h)</div>
           <div class="setting-row">
             <input type="number" id="speed" min="0" max="350" step="1" value="0" class="input-control" />
@@ -121,6 +133,7 @@
     <div class="toolbar-left">
       <span class="badge file-badge" id="file-badge">—</span>
       <span class="badge type" id="tyre-type-badge">TBR</span>
+      <span class="badge type" id="position-badge" style="background:#d81b60; color:#fff;">FR</span>
     </div>
     <div class="toolbar-right">
       <label class="switch-wrap">
@@ -152,6 +165,10 @@
       <div class="summary-label">Vehicle Speed</div>
       <div class="summary-value" id="speed-meta">0 km/h</div>
     </div>
+    <div class="summary-card">
+      <div class="summary-label">Position</div>
+      <div class="summary-value" id="pos-meta">FR</div>
+    </div>
   </div>
 
   <div class="dash-grid">
@@ -159,7 +176,7 @@
     <!-- ── PANEL A: Animation ── -->
     <div class="panel panel-animation">
       <div class="panel-header">
-        <span class="panel-title">Tyre Animation</span>
+        <span class="panel-title">Tyre Animation (Top-Down View)</span>
         <span class="panel-tag" id="anim-frame-tag">Frame —</span>
       </div>
       <div class="canvas-wrap">
@@ -207,41 +224,75 @@
     <!-- ── PANEL C: Metrics ── -->
     <div class="panel panel-metrics">
       <div class="panel-header">
-        <span class="panel-title">Frame Metrics</span>
+        <span class="panel-title">13 Tyre Parameters (Img 2 Standard)</span>
       </div>
       <div class="metrics-grid">
         <div class="metric-card">
-          <div class="metric-label">Frame Number</div>
-          <div class="metric-value" id="m-frame">—</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Peak Pressure</div>
-          <div class="metric-value" id="m-peak">—</div>
-          <div class="metric-unit">PSI</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Avg Pressure</div>
-          <div class="metric-value" id="m-avg">—</div>
-          <div class="metric-unit">PSI</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Contact Area</div>
+          <div class="metric-label">1. Contact Area</div>
           <div class="metric-value" id="m-area">—</div>
           <div class="metric-unit">mm²</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">Est. Load</div>
-          <div class="metric-value" id="m-load">—</div>
-          <div class="metric-unit">kg</div>
+          <div class="metric-label">2. Contact Ratio</div>
+          <div class="metric-value" id="m-ratio">—</div>
+          <div class="metric-unit">%</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">Active Sensels</div>
-          <div class="metric-value" id="m-sensels">—</div>
+          <div class="metric-label">3. FP Width</div>
+          <div class="metric-value" id="m-fp-w">—</div>
+          <div class="metric-unit">mm</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">4. FP Length</div>
+          <div class="metric-value" id="m-fp-l">—</div>
+          <div class="metric-unit">mm</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">5. Outer Shoulder S1</div>
+          <div class="metric-value" id="m-s1">—</div>
+          <div class="metric-unit">mm</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">6. Inner Shoulder S2</div>
+          <div class="metric-value" id="m-s2">—</div>
+          <div class="metric-unit">mm</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">7. Shoulder Skewness</div>
+          <div class="metric-value" id="m-skew">—</div>
+          <div class="metric-unit">%</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">8. Squareness (S1/S2)</div>
+          <div class="metric-value" id="m-sq-ratio">—</div>
+          <div class="metric-unit">%</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">9. Squareness (Avg)</div>
+          <div class="metric-value" id="m-sq-avg">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">10. Land/Sea Ratio</div>
+          <div class="metric-value" id="m-ls-ratio">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">11. Contact Pressure</div>
+          <div class="metric-value" id="m-avg">—</div>
+          <div class="metric-unit">PSI</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">12. Max Length</div>
+          <div class="metric-value" id="m-max-l">—</div>
+          <div class="metric-unit">mm</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">13. Max Width</div>
+          <div class="metric-value" id="m-max-w">—</div>
+          <div class="metric-unit">mm</div>
         </div>
         <div class="metric-card metric-wide">
-          <div class="metric-label">Contact Coverage</div>
-          <div class="metric-value" id="m-pct">—</div>
-          <div class="metric-unit">%</div>
+          <div class="metric-label">Frame & Peak Info</div>
+          <div style="font-size:12px; margin-top:4px;">Frame <span id="m-frame">—</span> · Peak <span id="m-peak">—</span> PSI · Load <span id="m-load">—</span> kg</div>
           <div class="coverage-bar-bg"><div class="coverage-bar-fill" id="coverage-bar"></div></div>
         </div>
       </div>

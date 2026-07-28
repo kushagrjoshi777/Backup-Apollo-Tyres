@@ -72,6 +72,8 @@ def upload():
     except ValueError:
         speed = 0.0
 
+    position = request.form.get("position", "FR").upper()
+
     filename  = secure_filename(f.filename)
     job_id    = str(uuid.uuid4())
     save_path = os.path.join(UPLOAD_DIR, f"{job_id}_{filename}")
@@ -82,7 +84,7 @@ def upload():
 
     thread = threading.Thread(
         target=_run_processing,
-        args=(job_id, save_path, tyre_type, min_pressure, max_pressure, speed),
+        args=(job_id, save_path, tyre_type, min_pressure, max_pressure, speed, position, filename),
         daemon=True
     )
     thread.start()
@@ -126,8 +128,8 @@ def export_pdf(job_id):
     if job is None or job["status"] != "done":
         return jsonify({"error": "Job not found or not ready"}), 404
 
-    data = request.get_json()
-    speed = data.get("speed", 0)
+    data = request.get_json() or {}
+    speed = data.get("speed", job["result"].get("speed", 0))
     canvas_data = data.get("canvas_data", "")  # Base64 PNG from frontend
 
     try:
@@ -136,7 +138,7 @@ def export_pdf(job_id):
             io.BytesIO(pdf_bytes),
             mimetype="application/pdf",
             as_attachment=True,
-            download_name=f"Apollo_TyrePressure_{int(speed)}kmph_Report.pdf"
+            download_name=f"Apollo_TyreWear_Analysis_{int(speed)}kmph_Report.pdf"
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -144,9 +146,17 @@ def export_pdf(job_id):
 
 # ── Background worker ─────────────────────────────────────────────────────────
 
-def _run_processing(job_id: str, filepath: str, tyre_type: str, min_pressure: float, max_pressure: float, speed: float):
+def _run_processing(job_id: str, filepath: str, tyre_type: str, min_pressure: float, max_pressure: float, speed: float, position: str, filename: str):
     try:
-        result = load_and_process(filepath, tyre_type=tyre_type, min_pressure=min_pressure, max_pressure=max_pressure, speed=speed)
+        result = load_and_process(
+            filepath,
+            tyre_type=tyre_type,
+            min_pressure=min_pressure,
+            max_pressure=max_pressure,
+            speed=speed,
+            position=position
+        )
+        result["source_file"] = filename
         with _jobs_lock:
             _jobs[job_id] = {"status": "done", "result": result}
     except Exception as exc:

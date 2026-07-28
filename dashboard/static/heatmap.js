@@ -160,89 +160,150 @@ function applyNoiseFilter(srcData) {
 }
 
 /**
- * Calculates tyre metrics and contact patch bounds for a flat uint8 array on the fly.
- * Matches calculations in processor.py.
- * @param {Uint8Array} data - flat uint8 array
- * @param {number} vmax - VMAX PSI
- * @param {number} frameNumber - current frame number
+ * Calculates all 13 tyre parameters and contact patch for a flat uint8 array.
+ * Matches processor.py _frame_metrics_13() exactly.
+ * @param {Uint8Array|Array} data       – flat 256×256 uint8 normalised values (0-255)
+ * @param {number}           vmin       – min pressure PSI (threshold)
+ * @param {number}           vmax       – max pressure PSI (scale ceiling)
+ * @param {number}           frameNumber
+ * @param {string}           [position] – 'FL'|'FR'|'RL'|'RR' for S1/S2 side assignment
  */
-function computeFrameMetrics(data, vmin, vmax, frameNumber) {
+function computeFrameMetrics(data, vmin, vmax, frameNumber, position) {
   const W = 256, H = 256;
-  const SENSEL_AREA_MM2 = 6.45;
-  const PSI_TO_N_PER_MM2 = 0.00689476;
-  
-  // vmin PSI threshold converted to uint8 level
+  const SENSEL_MM   = 1.6;     // mm per sensel (XSENSOR 256×256 standard)
+  const SENSEL_AREA = SENSEL_MM * SENSEL_MM;   // 2.56 mm²
+  const PSI_TO_N    = 0.00689476;
+
   const threshByte = Math.ceil((vmin / vmax) * 255);
+  const pos = (position || 'FR').toUpperCase();
 
-  let active = 0;
-  let sumPsi = 0;
-  let maxByte = 0;
+  let active = 0, sumPsi = 0, maxByte = 0;
+  let rMin = H, rMax = -1, cMin = W, cMax = -1;
 
-  // Bounding box bounds (original_coords format: row index is from lower to upper in mat, 
-  // but note that our serialized array is already flipped vertically (origin=lower to origin=upper).
-  // Thus row index in flat array corresponds to (255 - row_origin_lower).
-  // Let's find min/max row/col values.
-  let rowMin = H, rowMax = -1;
-  let colMin = W, colMax = -1;
-
+  // ── Pass 1: bounding box + basic aggregates ───────────────────────────────
   for (let r = 0; r < H; r++) {
-    const rOffset = r * W;
+    const off = r * W;
     for (let c = 0; c < W; c++) {
-      const b = data[rOffset + c];
+      const b = data[off + c];
       if (b > maxByte) maxByte = b;
-
       if (b > threshByte) {
         active++;
-        const psi = (b / 255) * vmax;
-        sumPsi += psi;
-
-        // Since the array is flipped vertically in serialise_frame,
-        // row r = 0 is actually the TOP row (index 255 in original array).
-        // Let's reconstruct the original y-coordinate (origin=lower):
-        // original_y = 255 - r
-        const origY = 255 - r;
-
-        if (origY < rowMin) rowMin = origY;
-        if (origY > rowMax) rowMax = origY;
-        if (c < colMin) colMin = c;
-        if (c > colMax) colMax = c;
+        sumPsi += (b / 255) * vmax;
+        if (r < rMin) rMin = r;
+        if (r > rMax) rMax = r;
+        if (c < cMin) cMin = c;
+        if (c > cMax) cMax = c;
       }
     }
   }
 
-  const peakPsi = (maxByte / 255) * vmax;
-  const avgPsi = active > 0 ? sumPsi / active : 0.0;
-  const contactAreaMm2 = active * SENSEL_AREA_MM2;
-  const totalLoadN = sumPsi * PSI_TO_N_PER_MM2 * SENSEL_AREA_MM2;
-  const totalLoadKg = totalLoadN / 9.80665;
+  const peakPsi   = (maxByte / 255) * vmax;
+  const avgPsi    = active > 0 ? sumPsi / active : 0;
+  const loadKg    = (sumPsi * PSI_TO_N * SENSEL_AREA) / 9.80665;
+  const areaM2    = active * SENSEL_AREA;
   const contactPct = (active / (W * H)) * 100;
 
-  let widthMm = 0;
-  let lengthMm = 0;
-  let bbox = [0, 0, 0, 0];
-
-  if (rowMax >= 0) {
-    const heightSensels = rowMax - rowMin + 1;
-    const widthSensels = colMax - colMin + 1;
-    lengthMm = Math.round(heightSensels * 2.54 * 10) / 10;
-    widthMm = Math.round(widthSensels * 2.54 * 10) / 10;
-    bbox = [colMin, rowMin, colMax, rowMax];
+  if (rMax < 0) {
+    // No active sensels
+    const z = { frame_number: frameNumber, contact_area_mm2: 0, contact_ratio_pct: 0,
+      fp_width_mm: 0, fp_length_mm: 0, outer_shoulder_s1_mm: 0, inner_shoulder_s2_mm: 0,
+      shoulder_skewness_pct: 0, squareness_s1_s2_pct: 100, squareness_avg: 0,
+      land_sea_ratio: 0, contact_pressure_psi: 0, maximum_length_mm: 0, maximum_width_mm: 0,
+      peak_pressure_psi: 0, avg_pressure_psi: 0, estimated_load_kg: 0,
+      active_sensels: 0, contact_pct: 0 };
+    return { metrics: z, contact_patch: { width_mm: 0, length_mm: 0, bbox: [0,0,0,0] } };
   }
+
+  const bboxH   = rMax - rMin + 1;
+  const bboxW   = cMax - cMin + 1;
+  const fpLen   = Math.round(bboxH * SENSEL_MM * 10) / 10;
+  const fpWid   = Math.round(bboxW * SENSEL_MM * 10) / 10;
+  const bboxArea = bboxH * bboxW;
+  const contRatio = bboxArea > 0 ? Math.round((active / bboxArea) * 1000) / 10 : 0;
+  const landSea   = bboxArea > active ? Math.round((active / (bboxArea - active)) * 100) / 100 : 0;
+
+  // ── Pass 2: per-column lengths (for max-length, shoulder strips) ─────────
+  const colLengths = new Array(bboxW).fill(0);
+  let maxColLen = 0;
+  for (let ci = 0; ci < bboxW; ci++) {
+    const c = cMin + ci;
+    let cRmin = -1, cRmax = -1;
+    for (let r = rMin; r <= rMax; r++) {
+      if (data[r * W + c] > threshByte) {
+        if (cRmin < 0) cRmin = r;
+        cRmax = r;
+      }
+    }
+    const len = cRmax >= 0 ? cRmax - cRmin + 1 : 0;
+    colLengths[ci] = len;
+    if (len > maxColLen) maxColLen = len;
+  }
+  const maxLenMm = Math.round(maxColLen * SENSEL_MM * 10) / 10;
+
+  // ── Pass 3: per-row widths (for max-width) ────────────────────────────────
+  let maxRowWid = 0;
+  for (let r = rMin; r <= rMax; r++) {
+    let rCmin = -1, rCmax = -1;
+    const off = r * W;
+    for (let c = cMin; c <= cMax; c++) {
+      if (data[off + c] > threshByte) {
+        if (rCmin < 0) rCmin = c;
+        rCmax = c;
+      }
+    }
+    const w = rCmax >= 0 ? rCmax - rCmin + 1 : 0;
+    if (w > maxRowWid) maxRowWid = w;
+  }
+  const maxWidMm = Math.round(maxRowWid * SENSEL_MM * 10) / 10;
+
+  // ── Shoulder S1 / S2 (outer 20% strips) ──────────────────────────────────
+  const shoulderW = Math.max(2, Math.round(0.20 * bboxW));
+  const leftLens  = colLengths.slice(0, shoulderW);
+  const rightLens = colLengths.slice(-shoulderW);
+  const leftMm    = leftLens.reduce((a, b) => a + b, 0) / leftLens.length * SENSEL_MM;
+  const rightMm   = rightLens.reduce((a, b) => a + b, 0) / rightLens.length * SENSEL_MM;
+
+  // FL & RL → outer = left side;  FR & RR → outer = right side
+  const s1 = Math.round((['FL','RL'].includes(pos) ? leftMm : rightMm) * 10) / 10;
+  const s2 = Math.round((['FL','RL'].includes(pos) ? rightMm : leftMm) * 10) / 10;
+
+  const sAvg     = (s1 + s2) / 2;
+  const skewness = sAvg > 0 ? Math.round(((s1 - s2) / sAvg) * 1000) / 10 : 0;
+  const sqRatio  = s2 > 0   ? Math.round((s1 / s2) * 1000) / 10 : 100;
+  const sqAvg    = fpLen > 0 ? Math.round((sAvg / fpLen) * 100) / 100 : 0;
+
+  // ── Reconstruct original bbox coords (origin=lower for overlay drawing) ──
+  const origR0 = 255 - rMax;
+  const origR1 = 255 - rMin;
+  const bboxOrig = [cMin, origR0, cMax, origR1];
 
   return {
     metrics: {
-      frame_number: frameNumber,
-      peak_pressure_psi: Math.round(peakPsi * 100) / 100,
-      avg_pressure_psi: Math.round(avgPsi * 100) / 100,
-      contact_area_mm2: Math.round(contactAreaMm2 * 10) / 10,
-      estimated_load_kg: Math.round(totalLoadKg * 10) / 10,
-      active_sensels: active,
-      contact_pct: Math.round(contactPct * 100) / 100
+      frame_number:          frameNumber,
+      contact_area_mm2:      Math.round(areaM2 * 10) / 10,
+      contact_ratio_pct:     contRatio,
+      fp_width_mm:           fpWid,
+      fp_length_mm:          fpLen,
+      outer_shoulder_s1_mm:  s1,
+      inner_shoulder_s2_mm:  s2,
+      shoulder_skewness_pct: skewness,
+      squareness_s1_s2_pct:  sqRatio,
+      squareness_avg:        sqAvg,
+      land_sea_ratio:        landSea,
+      contact_pressure_psi:  Math.round(avgPsi * 100) / 100,
+      maximum_length_mm:     maxLenMm,
+      maximum_width_mm:      maxWidMm,
+      // Backward-compat aliases
+      peak_pressure_psi:     Math.round(peakPsi * 100) / 100,
+      avg_pressure_psi:      Math.round(avgPsi * 100) / 100,
+      estimated_load_kg:     Math.round(loadKg * 10) / 10,
+      active_sensels:        active,
+      contact_pct:           Math.round(contactPct * 100) / 100,
     },
     contact_patch: {
-      width_mm: widthMm,
-      length_mm: lengthMm,
-      bbox: bbox
+      width_mm:  fpWid,
+      length_mm: fpLen,
+      bbox: bboxOrig,
     }
   };
 }
