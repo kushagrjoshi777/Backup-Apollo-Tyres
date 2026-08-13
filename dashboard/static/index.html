@@ -14,20 +14,14 @@
 <!-- jsPDF library -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.4.0/jspdf.umd.min.js"></script>
 <script>
-  // Wait for jsPDF to load
   let jsPDFReady = false;
   const checkjsPDF = setInterval(() => {
     if (typeof jsPDF !== 'undefined') {
       window.jsPDFLib = jsPDF;
       jsPDFReady = true;
       clearInterval(checkjsPDF);
-      console.log('jsPDF loaded successfully');
     }
   }, 100);
-  
-  setTimeout(() => {
-    if (!jsPDFReady) console.warn('jsPDF library failed to load within timeout');
-  }, 5000);
 </script>
 
 <!-- ══════════════════ HEADER ══════════════════ -->
@@ -66,12 +60,12 @@
         </svg>
       </div>
       <h1 class="upload-title">XSENSOR Tyre Pressure Analysis</h1>
-      <p class="upload-sub">Upload your tyre pressure CSV file for detailed analysis</p>
-      
+      <p class="upload-sub">Upload your tyre pressure <strong>.csv</strong> or <strong>.xsn</strong> file for detailed analysis</p>
+
       <!-- Unified Settings -->
       <div class="upload-settings" onclick="event.stopPropagation()">
         <div class="setting-group">
-          <div class="setting-label">Configuration</div>
+          <div class="setting-label">Pressure Configuration</div>
           <div class="setting-row">
             <select id="tyre-preset" class="select-control">
               <option value="tbr-preset">TBR (5–220 PSI)</option>
@@ -80,7 +74,7 @@
             </select>
           </div>
         </div>
-        
+
         <div class="setting-group" id="custom-range-group" style="display:none;">
           <div class="setting-label">Pressure Range</div>
           <div class="setting-row">
@@ -92,7 +86,7 @@
             <span class="value-display" id="max-val">220 PSI</span>
           </div>
         </div>
-        
+
         <div class="setting-group">
           <div class="setting-label">Tyre Position</div>
           <div class="setting-row">
@@ -111,11 +105,27 @@
             <input type="number" id="speed" min="0" max="350" step="1" value="0" class="input-control" />
           </div>
         </div>
+
+        <!-- FFT Noise Reduction -->
+        <div class="setting-group">
+          <div class="setting-label">
+            FFT Noise Reduction
+            <span class="setting-hint" id="fft-hint">Keep 97% of signal</span>
+          </div>
+          <div class="setting-row fft-row">
+            <span class="fft-label">Aggressive</span>
+            <input type="range" id="fft-keep" min="70" max="99" value="97" step="1" class="slider-range fft-slider" />
+            <span class="fft-label">Mild</span>
+          </div>
+          <div class="setting-row" style="justify-content:center; margin-top:4px;">
+            <span class="value-display" id="fft-val">97% preserved</span>
+          </div>
+        </div>
       </div>
 
       <label class="upload-btn" for="file-input">Choose File</label>
-      <input type="file" id="file-input" accept=".csv" hidden />
-      <p class="upload-note">Supports raw and pre-trimmed XSENSOR exports · up to 2 GB</p>
+      <input type="file" id="file-input" accept=".csv,.xsn" hidden />
+      <p class="upload-note">Supports .csv and .xsn XSENSOR exports · up to 2 GB</p>
     </div>
     <div id="upload-progress" class="progress-wrap hidden">
       <div class="progress-label" id="progress-label">Uploading…</div>
@@ -128,25 +138,36 @@
 <!-- ══════════════════ DASHBOARD PAGE ══════════════════ -->
 <section id="dashboard-page" class="page">
 
+  <!-- Provisional PSI banner (XSN only) -->
+  <div id="provisional-banner" class="provisional-banner" style="display:none;">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+      <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+    </svg>
+    <span>XSN Provisional PSI — Raw-to-PSI conversion is approximate. Values are <strong>not certified</strong> until calibration is established.</span>
+  </div>
+
   <!-- Toolbar -->
   <div class="dash-toolbar">
     <div class="toolbar-left">
       <span class="badge file-badge" id="file-badge">—</span>
       <span class="badge type" id="tyre-type-badge">TBR</span>
       <span class="badge type" id="position-badge" style="background:#d81b60; color:#fff;">FR</span>
+      <span class="badge type" id="fft-badge" style="background:#1565c0; color:#fff;">FFT 97%</span>
+      <span class="badge type" id="frame-rate-badge" style="background:#6a1b9a; color:#fff; display:none;"></span>
     </div>
     <div class="toolbar-right">
       <label class="switch-wrap">
         <input type="checkbox" id="noise-toggle" />
         <span class="switch-toggle"></span>
-        <span class="switch-label">Noise Filter</span>
+        <span class="switch-label">Morph Filter</span>
       </label>
       <button class="ghost-btn" id="export-btn" title="Export results">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10z"/>
           <polyline points="14 2 14 10 22 10"/>
         </svg>
-        Export
+        Export PDF
       </button>
       <button class="ghost-btn" id="new-file-btn" title="Upload new file">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -169,6 +190,18 @@
       <div class="summary-label">Position</div>
       <div class="summary-value" id="pos-meta">FR</div>
     </div>
+    <div class="summary-card">
+      <div class="summary-label">FFT Filter</div>
+      <div class="summary-value" id="fft-meta">97% kept</div>
+    </div>
+    <div class="summary-card" id="framerate-card" style="display:none;">
+      <div class="summary-label">Frame Rate</div>
+      <div class="summary-value" id="framerate-meta">—</div>
+    </div>
+    <div class="summary-card" id="totalframes-card" style="display:none;">
+      <div class="summary-label">Total Frames (file)</div>
+      <div class="summary-value" id="totalframes-meta">—</div>
+    </div>
   </div>
 
   <div class="dash-grid">
@@ -179,7 +212,7 @@
         <span class="panel-title">Tyre Animation (Top-Down View)</span>
         <span class="panel-tag" id="anim-frame-tag">Frame —</span>
       </div>
-      <div class="canvas-wrap">
+      <div class="canvas-wrap" id="anim-canvas-wrap">
         <canvas id="anim-canvas" width="256" height="256"></canvas>
         <canvas id="anim-overlay" width="256" height="256" class="canvas-overlay hidden"></canvas>
       </div>
@@ -215,7 +248,7 @@
           <button class="ghost-btn small" id="best-frame-btn">Use frame</button>
         </div>
       </div>
-      <div class="canvas-wrap canvas-wrap-large">
+      <div class="canvas-wrap canvas-wrap-large" id="best-canvas-wrap">
         <canvas id="best-canvas" width="256" height="256"></canvas>
         <canvas id="best-overlay" width="256" height="256" class="canvas-overlay"></canvas>
       </div>
@@ -278,7 +311,7 @@
         <div class="metric-card">
           <div class="metric-label">11. Contact Pressure</div>
           <div class="metric-value" id="m-avg">—</div>
-          <div class="metric-unit">PSI</div>
+          <div class="metric-unit" id="psi-unit-label">PSI</div>
         </div>
         <div class="metric-card">
           <div class="metric-label">12. Max Length</div>
@@ -325,7 +358,7 @@
           <div class="dim-unit">mm</div>
         </div>
       </div>
-      <div class="patch-note">Bounding box overlay shown on Best Contact Frame</div>
+      <div class="patch-note">Exact tyre outline (white) drawn on Best Contact Frame</div>
       <div class="colorbar-wrap">
         <div class="colorbar-label">Pressure Scale</div>
         <canvas id="colorbar-canvas" width="200" height="18"></canvas>

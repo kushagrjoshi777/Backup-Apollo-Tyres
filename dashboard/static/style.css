@@ -993,3 +993,119 @@ html, body {
     flex-direction: column;
   }
 }
+
+/* ═══════════════════════════════════════════════════════
+   FFT SLIDER & EXTRAS
+═══════════════════════════════════════════════════════ */
+
+/* Setting label with inline hint */
+.setting-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.setting-hint {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--purple);
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* FFT slider row: aggressive ←——→ mild */
+.fft-row {
+  gap: 10px;
+}
+
+.fft-label {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* FFT slider accent colour: blue */
+.fft-slider::-webkit-slider-thumb {
+  background: #1565c0 !important;
+  box-shadow: 0 2px 6px rgba(21, 101, 192, 0.35) !important;
+}
+
+.fft-slider::-webkit-slider-thumb:hover {
+  background: #1976d2 !important;
+}
+
+/* Patch note */
+.patch-note {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-style: italic;
+  text-align: center;
+  padding: 4px 0;
+}
+
+/* Speed row inside animation panel */
+.speed-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+/* Panel header with control */
+.panel-header-with-control {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Canvas wrap large */
+.canvas-wrap-large {
+  flex: 1;
+}
+
+/* ═══════════════════════════════════════════════════════
+   PROVISIONAL PSI BANNER (XSN)
+═══════════════════════════════════════════════════════ */
+
+.provisional-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 24px;
+  background: linear-gradient(90deg, #fff3e0, #ffe0b2);
+  border-bottom: 2px solid #f57c00;
+  color: #bf360c;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.provisional-banner svg {
+  flex-shrink: 0;
+  color: #e65100;
+}
+
+.provisional-banner strong {
+  font-weight: 700;
+}
+
+.theme-dark .provisional-banner {
+  background: linear-gradient(90deg, #3e2723, #4e342e);
+  border-bottom-color: #ff9800;
+  color: #ffcc80;
+}
+
+.theme-dark .provisional-banner svg {
+  color: #ffb74d;
+}
+
+.tick-unit {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  margin-left: 4px;
+}

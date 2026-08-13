@@ -1,5 +1,6 @@
 """
 app.py  —  Apollo Tyre Dashboard  — Flask backend
+Supports CSV and .XSN files.
 """
 
 import os
@@ -32,7 +33,7 @@ app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024   # 2 GB
 _jobs: dict[str, dict] = {}    # job_id → {"status", "result"|"error"}
 _jobs_lock = threading.Lock()
 
-ALLOWED_EXTS = {".csv"}
+ALLOWED_EXTS = {".csv", ".xsn"}
 
 
 def _allowed(filename: str) -> bool:
@@ -48,7 +49,7 @@ def index():
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    """Receive CSV, kick off background processing, return job_id."""
+    """Receive CSV or XSN, kick off background processing, return job_id."""
     if "file" not in request.files:
         return jsonify({"error": "No file part"}), 400
 
@@ -57,7 +58,7 @@ def upload():
         return jsonify({"error": "No file selected"}), 400
 
     if not _allowed(f.filename):
-        return jsonify({"error": "Only .csv files are accepted"}), 400
+        return jsonify({"error": "Only .csv and .xsn files are accepted"}), 400
 
     tyre_type = request.form.get("tyre_type", "TBR")
     try:
@@ -72,6 +73,12 @@ def upload():
     except ValueError:
         speed = 0.0
 
+    try:
+        fft_keep_ratio = float(request.form.get("fft_keep_ratio", 0.97))
+        fft_keep_ratio = max(0.50, min(1.0, fft_keep_ratio))   # clamp [0.5, 1.0]
+    except ValueError:
+        fft_keep_ratio = 0.97
+
     position = request.form.get("position", "FR").upper()
 
     filename  = secure_filename(f.filename)
@@ -84,7 +91,11 @@ def upload():
 
     thread = threading.Thread(
         target=_run_processing,
-        args=(job_id, save_path, tyre_type, min_pressure, max_pressure, speed, position, filename),
+        args=(
+            job_id, save_path, tyre_type,
+            min_pressure, max_pressure,
+            speed, position, filename, fft_keep_ratio
+        ),
         daemon=True
     )
     thread.start()
@@ -146,17 +157,53 @@ def export_pdf(job_id):
 
 # ── Background worker ─────────────────────────────────────────────────────────
 
-def _run_processing(job_id: str, filepath: str, tyre_type: str, min_pressure: float, max_pressure: float, speed: float, position: str, filename: str):
+def _run_processing(
+    job_id: str,
+    filepath: str,
+    tyre_type: str,
+    min_pressure: float,
+    max_pressure: float,
+    speed: float,
+    position: str,
+    filename: str,
+    fft_keep_ratio: float,
+):
     try:
+        # ── [XSN-DIAG] Upload traceability ────────────────────────────────
+        ext = os.path.splitext(filename)[1].lower()
+        fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+        print(f"[XSN-DIAG] ═══════════════════════════════════════════════════")
+        print(f"[XSN-DIAG] _run_processing() started")
+        print(f"[XSN-DIAG]   job_id       : {job_id}")
+        print(f"[XSN-DIAG]   filename     : {filename}")
+        print(f"[XSN-DIAG]   extension    : {ext}")
+        print(f"[XSN-DIAG]   saved path   : {filepath}")
+        print(f"[XSN-DIAG]   file size    : {fsize:,} bytes ({fsize / 1048576:.1f} MB)")
+        print(f"[XSN-DIAG]   calling      : processor.load_and_process()")
+        print(f"[XSN-DIAG] ═══════════════════════════════════════════════════")
+        # ─────────────────────────────────────────────────────────────────
+
         result = load_and_process(
             filepath,
             tyre_type=tyre_type,
             min_pressure=min_pressure,
             max_pressure=max_pressure,
             speed=speed,
-            position=position
+            position=position,
+            fft_keep_ratio=fft_keep_ratio,
         )
         result["source_file"] = filename
+
+        # ── [XSN-DIAG] Result summary ─────────────────────────────────────
+        print(f"[XSN-DIAG] Processing complete for {filename}")
+        print(f"[XSN-DIAG]   playback frames : {len(result['frame_numbers'])}")
+        print(f"[XSN-DIAG]   best frame      : {result['best_frame_number']}")
+        print(f"[XSN-DIAG]   peak PSI        : {result['best_metrics']['peak_pressure_psi']}")
+        print(f"[XSN-DIAG]   is_provisional  : {result.get('is_provisional')}")
+        print(f"[XSN-DIAG]   PIPELINE: upload → app.py → processor.py → parser.py → xsn_parser.py → XSNReader → heatmap")
+        print(f"[XSN-DIAG] ═══════════════════════════════════════════════════")
+        # ─────────────────────────────────────────────────────────────────
+
         with _jobs_lock:
             _jobs[job_id] = {"status": "done", "result": result}
     except Exception as exc:
