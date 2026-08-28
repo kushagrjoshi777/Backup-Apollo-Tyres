@@ -188,29 +188,48 @@ class XSNReader:
 
 
 # ---------------------------------------------------------
-# PROVISIONAL raw → PSI conversion
+# Empirically calibrated raw → PSI conversion
+# ---------------------------------------------------------
+# Verified against 245_50R20_FL_Static CSV ground truth.
+# Across frames 1–2813, for non-zero values:
+#   correlation(XSN_RAW / 128, CSV_PSI) ≈ 0.999999995
+#   max error ≈ 0.005 PSI (CSV rounding to 2 decimals)
+#
+# Keep this function isolated so calibration can be updated
+# if Apollo provides a different sensor calibration.
 # ---------------------------------------------------------
 
+_XSN_CALIBRATION_DIVISOR: float = 128.0
+_XSN_NOISE_THRESHOLD_PSI: float = 5.0
+
+
 def raw_to_psi(
-    raw,
-    full_scale_psi=200.0
-):
+    raw: np.ndarray,
+    *,
+    threshold_psi: float = _XSN_NOISE_THRESHOLD_PSI,
+) -> np.ndarray:
+    """Convert raw uint16 XSN sensor values to PSI.
 
-    raw = raw.astype(
-        np.float32
-    )
+    Parameters
+    ----------
+    raw : ndarray
+        Raw uint16 matrix from XSNReader.get_frame().
+    threshold_psi : float
+        Values below this are set to 0 (matching CSV export behaviour).
+        Set to 0.0 to disable thresholding.
 
+    Returns
+    -------
+    ndarray (float32)
+        Pressure in PSI.
+    """
+    psi = raw.astype(np.float32) / _XSN_CALIBRATION_DIVISOR
 
-    psi = (
-        raw *
-        full_scale_psi /
-        65535.0
-    )
-
-
-    # 65535 appears as saturation / invalid
-    # in the raw recordings we inspected.
+    # 65535 appears as saturation / invalid in raw recordings.
     psi[raw >= 65535] = np.nan
 
+    # Zero out sub-threshold values (matches CSV Threshold = 5.0 PSI).
+    if threshold_psi > 0.0:
+        psi[psi < threshold_psi] = 0.0
 
     return psi

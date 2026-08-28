@@ -25,9 +25,6 @@ from xsn_parser import XSNReader, raw_to_psi
 # Conversion constant for legacy parse_xsensor_csv auto-detection
 XSN_RAW_TO_PSI: float = 220.0 / 65535.0
 
-# XSN provisional full-scale PSI (isolated, configurable)
-XSN_FULL_SCALE_PSI: float = 200.0
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public interface
@@ -133,7 +130,7 @@ def parse_xsn_lazy(filepath: str, max_frames: int = 2000) -> dict:
     print(f"[XSN-DIAG]   file size    : {file_size:,} bytes ({file_size / 1048576:.1f} MB)")
     print(f"[XSN-DIAG]   parser module: {__file__}")
     print(f"[XSN-DIAG]   reader class : src/xsn_parser.py -> XSNReader")
-    print(f"[XSN-DIAG]   conversion   : raw_to_psi(full_scale={XSN_FULL_SCALE_PSI})")
+    print(f"[XSN-DIAG]   conversion   : raw_to_psi (raw / 128.0, threshold 5 PSI)")
     # ─────────────────────────────────────────────────────────────────────
 
     try:
@@ -158,7 +155,7 @@ def parse_xsn_lazy(filepath: str, max_frames: int = 2000) -> dict:
 
         for i in range(n_to_read):
             raw_matrix = reader.get_frame(i)  # uint16 256×256
-            psi_matrix = raw_to_psi(raw_matrix, full_scale_psi=XSN_FULL_SCALE_PSI)
+            psi_matrix = raw_to_psi(raw_matrix)
             # Replace NaN (saturated 65535 values) with 0 for downstream compatibility
             psi_matrix = np.nan_to_num(psi_matrix, nan=0.0)
             frames[i] = psi_matrix
