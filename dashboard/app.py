@@ -4,12 +4,20 @@ Supports CSV and .XSN files.
 """
 
 import os
+import sys
 import uuid
 import json
 import threading
 import base64
 import io
 from datetime import datetime
+
+# Ensure stdout/stderr handles UTF-8 safely on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 
 from flask import (
     Flask, request, jsonify,
@@ -172,7 +180,7 @@ def _run_processing(
         # ── [XSN-DIAG] Upload traceability ────────────────────────────────
         ext = os.path.splitext(filename)[1].lower()
         fsize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-        print(f"[XSN-DIAG] ═══════════════════════════════════════════════════")
+        print(f"[XSN-DIAG] ===========================================================")
         print(f"[XSN-DIAG] _run_processing() started")
         print(f"[XSN-DIAG]   job_id       : {job_id}")
         print(f"[XSN-DIAG]   filename     : {filename}")
@@ -180,8 +188,8 @@ def _run_processing(
         print(f"[XSN-DIAG]   saved path   : {filepath}")
         print(f"[XSN-DIAG]   file size    : {fsize:,} bytes ({fsize / 1048576:.1f} MB)")
         print(f"[XSN-DIAG]   calling      : processor.load_and_process()")
-        print(f"[XSN-DIAG] ═══════════════════════════════════════════════════")
-        # ─────────────────────────────────────────────────────────────────
+        print(f"[XSN-DIAG] ===========================================================")
+        # -----------------------------------------------------------------
 
         result = load_and_process(
             filepath,
@@ -194,14 +202,14 @@ def _run_processing(
         )
         result["source_file"] = filename
 
-        # ── [XSN-DIAG] Result summary ─────────────────────────────────────
+        # -- [XSN-DIAG] Result summary -------------------------------------
         print(f"[XSN-DIAG] Processing complete for {filename}")
         print(f"[XSN-DIAG]   playback frames : {len(result['frame_numbers'])}")
         print(f"[XSN-DIAG]   best frame      : {result['best_frame_number']}")
         print(f"[XSN-DIAG]   peak PSI        : {result['best_metrics']['peak_pressure_psi']}")
         print(f"[XSN-DIAG]   is_provisional  : {result.get('is_provisional')}")
-        print(f"[XSN-DIAG]   PIPELINE: upload → app.py → processor.py → parser.py → xsn_parser.py → XSNReader → heatmap")
-        print(f"[XSN-DIAG] ═══════════════════════════════════════════════════")
+        print(f"[XSN-DIAG]   PIPELINE: upload -> app.py -> processor.py -> parser.py -> xsn_parser.py -> XSNReader -> heatmap")
+        print(f"[XSN-DIAG] ===========================================================")
         # ─────────────────────────────────────────────────────────────────
 
         with _jobs_lock:
