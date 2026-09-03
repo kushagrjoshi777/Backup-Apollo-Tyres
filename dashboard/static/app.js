@@ -49,7 +49,6 @@ const fileBadge     = $('file-badge');
 const tyreTypeBadge = $('tyre-type-badge');
 const positionBadge = $('position-badge');
 const fftBadge      = $('fft-badge');
-const noiseToggle   = $('noise-toggle');
 const themeToggle   = $('theme-toggle');
 const newFileBtn    = $('new-file-btn');
 const exportBtn     = $('export-btn');
@@ -226,16 +225,6 @@ if (localStorage.getItem('theme-dark') === 'true') {
   document.documentElement.classList.add('theme-dark');
   themeToggle.parentElement.querySelector('.theme-label').textContent = 'Light';
 }
-
-// ── Noise (morphological) filter toggle ──────────────
-noiseToggle.addEventListener('change', () => {
-  state.noiseFilterActive = noiseToggle.checked;
-  if (state.data) {
-    renderBestFrame();
-    updateAnimFrame(state.frameIndex, false);
-  }
-});
-
 // ── File operations ───────────────────────────────────
 newFileBtn.addEventListener('click', resetToUpload);
 exportBtn.addEventListener('click', exportResults);
@@ -413,14 +402,12 @@ function showDashboard(data) {
   tyreTypeBadge.textContent = tyre_type;
   if (positionBadge) positionBadge.textContent = position || state.position;
   if (fftBadge)      fftBadge.textContent = `FFT ${fftPct}%`;
-  if (pressureMeta)  pressureMeta.textContent = `${vmin}–${vmax} ${isProvisional ? 'Prov. PSI' : 'PSI'}`;
+  if (pressureMeta)  pressureMeta.textContent = `${vmin}–${vmax} PSI`;
   if (speedMeta)     speedMeta.textContent = `${speed} km/h`;
   if (posMeta)       posMeta.textContent = position || state.position;
   if (fftMeta)       fftMeta.textContent = `${fftPct}% kept`;
 
-  // XSN-specific UI elements
-  const provisionalBanner = $('provisional-banner');
-  if (provisionalBanner) provisionalBanner.style.display = isProvisional ? 'flex' : 'none';
+  // Provisional banner removed: XSN calibration validated
 
   const frameRateBadge = $('frame-rate-badge');
   if (frameRateBadge) {
@@ -454,9 +441,9 @@ function showDashboard(data) {
     }
   }
 
-  // Update PSI unit labels for provisional
+  // PSI unit label (always 'PSI' now that calibration is validated)
   const psiUnitLabel = $('psi-unit-label');
-  if (psiUnitLabel) psiUnitLabel.textContent = isProvisional ? 'Prov. PSI' : 'PSI';
+  if (psiUnitLabel) psiUnitLabel.textContent = 'PSI';
 
   drawColorbar(colorbarCvs, vmax);
   $('vmin-label').textContent = vmin;
@@ -510,34 +497,18 @@ function showDashboard(data) {
 }
 
 function renderBestFrame() {
-  const { frames, vmax, vmin, contact_patch, position } = state.data;
+  const { frames, contact_patch } = state.data;
   const frameNum = state.selectedFrameNumber ?? state.data.best_frame_number;
-  const rawFrame = frames[String(frameNum)];
+  const displayData = frames[String(frameNum)];
 
-  const displayData = state.noiseFilterActive
-    ? applyNoiseFilter(rawFrame, state.gridW, state.gridH)
-    : rawFrame;
+  const outlinePoints = (contact_patch || {}).outline_points || [];
+  const patchW = (contact_patch || {}).width_mm;
+  const patchL = (contact_patch || {}).length_mm;
 
-  // Re-compute metrics client-side (for noise-filtered view)
-  let outlinePoints = (contact_patch || {}).outline_points || [];
-  let patchW = (contact_patch || {}).width_mm;
-  let patchL = (contact_patch || {}).length_mm;
-
-  if (state.noiseFilterActive) {
-    const analyzed = computeFrameMetrics(
-      displayData, vmin, vmax, frameNum, position,
-      state.gridW, state.gridH, state.senselMm
-    );
-    outlinePoints = analyzed.contact_patch.outline_points;
-    patchW = analyzed.contact_patch.width_mm;
-    patchL = analyzed.contact_patch.length_mm;
-    updateMetrics(analyzed.metrics);
-  } else {
-    const bestIdx = state.data.best_frame_index;
-    const frameIdx = state.data.frame_numbers.indexOf(frameNum);
-    const m = state.data.metrics[frameIdx >= 0 ? frameIdx : bestIdx];
-    if (m) updateMetrics(m);
-  }
+  const bestIdx = state.data.best_frame_index;
+  const frameIdx = state.data.frame_numbers.indexOf(frameNum);
+  const m = state.data.metrics[frameIdx >= 0 ? frameIdx : bestIdx];
+  if (m) updateMetrics(m);
 
   drawHeatmap(bestCanvas, displayData, state.gridW, state.gridH);
   drawTyreOutline(bestOverlay, outlinePoints, state.gridW, state.gridH);
@@ -586,25 +557,13 @@ function animLoop(ts) {
 }
 
 function updateAnimFrame(idx, updateSlider = true) {
-  const { frame_numbers, frames, metrics, vmax, vmin, position } = state.data;
-  const fn       = frame_numbers[idx];
-  const rawFrame = frames[String(fn)];
-
-  const displayData = state.noiseFilterActive
-    ? applyNoiseFilter(rawFrame, state.gridW, state.gridH)
-    : rawFrame;
+  const { frame_numbers, frames, metrics } = state.data;
+  const fn          = frame_numbers[idx];
+  const displayData = frames[String(fn)];
 
   drawHeatmap(animCanvas, displayData, state.gridW, state.gridH);
 
-  if (state.noiseFilterActive) {
-    const analyzed = computeFrameMetrics(
-      displayData, vmin, vmax, fn, position,
-      state.gridW, state.gridH, state.senselMm
-    );
-    updateMetrics(analyzed.metrics);
-  } else {
-    if (metrics && metrics[idx]) updateMetrics(metrics[idx]);
-  }
+  if (metrics && metrics[idx]) updateMetrics(metrics[idx]);
 
   $('anim-frame-tag').textContent = `Frame ${fn}`;
   $('slider-label').textContent   = `Frame ${fn} (${idx + 1}/${frame_numbers.length})`;
@@ -725,9 +684,7 @@ function resetToUpload() {
   dashPage.classList.remove('active');
   uploadPage.classList.add('active');
 
-  // Hide XSN-specific UI elements
-  const provisionalBanner = $('provisional-banner');
-  if (provisionalBanner) provisionalBanner.style.display = 'none';
+  // Provisional banner removed: calibration validated
   const frameRateBadge = $('frame-rate-badge');
   if (frameRateBadge) frameRateBadge.style.display = 'none';
   const framerateCard = $('framerate-card');

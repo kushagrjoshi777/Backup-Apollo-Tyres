@@ -1,8 +1,3 @@
-"""
-pdf_export.py – PDF Report Generation
-Generates professional tyre wear analysis reports matching Image 1 & Image 2.
-"""
-
 import io
 import base64
 import numpy as np

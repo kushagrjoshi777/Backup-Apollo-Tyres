@@ -77,35 +77,33 @@ function drawTyreOutline(overlayCanvas, outlinePoints, gridW = 256, gridH = 256)
   const CH  = overlayCanvas.height;
   ctx.clearRect(0, 0, CW, CH);
 
-  if (!outlinePoints || outlinePoints.length < 4) return;
+  if (!outlinePoints || outlinePoints.length === 0) return;
 
   const scaleX = CW / gridW;
   const scaleY = CH / gridH;
 
-  // Draw exact outline polygon
-  ctx.beginPath();
-  const p0 = outlinePoints[0];
-  ctx.moveTo(p0.x * scaleX, p0.y * scaleY);
-  for (let i = 1; i < outlinePoints.length; i++) {
-    const p = outlinePoints[i];
-    ctx.lineTo(p.x * scaleX, p.y * scaleY);
+  const contours = Array.isArray(outlinePoints[0]) ? outlinePoints : [outlinePoints];
+
+  for (const contour of contours) {
+    if (!contour || contour.length < 3) continue;
+
+    ctx.beginPath();
+    const p0 = contour[0];
+    ctx.moveTo(p0.x * scaleX, p0.y * scaleY);
+    for (let i = 1; i < contour.length; i++) {
+      const p = contour[i];
+      ctx.lineTo(p.x * scaleX, p.y * scaleY);
+    }
+    ctx.closePath();
+
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.03)';
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+    ctx.lineWidth   = 1.2;
+    ctx.setLineDash([]);
+    ctx.stroke();
   }
-  ctx.closePath();
-
-  // White semi-transparent fill (very subtle – just to highlight the region)
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.04)';
-  ctx.fill();
-
-  // Bright white thin stroke — the exact tyre outline
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
-  ctx.lineWidth   = 1.2;
-  ctx.setLineDash([]);
-  ctx.stroke();
-
-  // Second pass: glow effect (slightly thicker, more transparent)
-  ctx.strokeStyle = 'rgba(200, 220, 255, 0.3)';
-  ctx.lineWidth   = 3;
-  ctx.stroke();
 }
 
 /**

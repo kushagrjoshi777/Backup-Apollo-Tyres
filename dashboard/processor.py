@@ -9,6 +9,7 @@ import re
 import numpy as np
 from scipy.fft import fft2, ifft2, fftshift, ifftshift
 from scipy.ndimage import median_filter
+import cv2
 
 # Allow importing from parent src/ directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -101,30 +102,60 @@ def apply_fft_butterworth(
     is_xsn: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Despikes single-pixel hardware errors (>200 PSI) and applies a 2D Butterworth FFT Lowpass filter
-    matching Jatin Files despike_and_fft_filter.
+    Adaptive despike + 2D Butterworth FFT Lowpass filter.
+    Preserves real pressure peaks (>200-500 PSI) while filtering high-frequency sensor noise.
     """
-    # 1. Despike single isolated hardware noise sensels
+    # 1. Adaptive despike without hard 200 PSI ceiling
     med = median_filter(frame_psi, size=3)
-    spike_mask = (frame_psi > 200.0) | (np.abs(frame_psi - med) > 50.0)
+    diff = np.abs(frame_psi - med)
+    spike_mask = diff > (20.0 + 0.3 * med)
     clean_frame = frame_psi.copy()
     clean_frame[spike_mask] = med[spike_mask]
 
-    # 2. Butterworth 2D FFT Filter (d0 = 140.0 * keep_ratio)
+    # 2. Butterworth 2D FFT Filter
     rows, cols = clean_frame.shape
     f_shift = fftshift(fft2(clean_frame.astype(np.float64)))
     cy, cx = rows // 2, cols // 2
     y, x = np.ogrid[-cy : rows - cy, -cx : cols - cx]
     d = np.sqrt(x**2 + y**2)
 
-    d0 = max(10.0, min(140.0, keep_ratio * 140.0))
+    # Scale cutoff d0 based on grid Nyquist radius (min(rows, cols) / 2)
+    f_nyquist = min(rows, cols) / 2.0
+    d0 = max(10.0, min(f_nyquist * 0.9, keep_ratio * f_nyquist * 0.85))
     h_butterworth = 1.0 / (1.0 + (d / max(1.0, d0)) ** (2 * butterworth_order))
 
     filtered = np.real(ifft2(ifftshift(f_shift * h_butterworth)))
     filtered = np.clip(filtered, 0.0, None)
 
+    # 3. Clean background noise below pressure threshold
+    filtered[filtered < PRESSURE_THRESHOLD] = 0.0
+
     noise = clean_frame - filtered
     return filtered.astype(np.float32), noise.astype(np.float32)
+
+
+def _segment_contact(
+    arr: np.ndarray,
+    threshold: float = 5.0,
+    min_area: int = 12,
+) -> np.ndarray:
+    """
+    Connected-component analysis to isolate genuine tyre contact patches
+    and reject background noise dots/artifacts.
+    """
+    binary = (arr >= threshold).astype(np.uint8)
+    if not np.any(binary):
+        return np.zeros(arr.shape, dtype=bool)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    clean_mask = np.zeros(arr.shape, dtype=bool)
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            clean_mask[labels == i] = True
+
+    return clean_mask
 
 
 def _xsn_temporal_average(
@@ -199,14 +230,16 @@ def load_and_process(
 
     frame_numbers = sorted(trimmed.keys())
 
-    # 2. Apply FFT noise reduction to all frames
+    # 2. Apply FFT noise reduction + contact segmentation to all frames
     filtered_frames: dict = {}
     for fn in frame_numbers:
         arr = trimmed[fn]
         if arr.dtype != np.float32:
             arr = arr.astype(np.float32)
         filtered, _ = apply_fft_butterworth(arr, keep_ratio=fft_keep_ratio, is_xsn=is_xsn)
-        filtered_frames[fn] = filtered
+        mask = _segment_contact(filtered, min_pressure)
+        segmented = np.where(mask, filtered, 0.0)
+        filtered_frames[fn] = segmented.astype(np.float32)
 
     # 3. Per-frame 13-parameter metrics (on filtered data)
     metrics_list = [
@@ -268,7 +301,7 @@ def _trim_frames(raw_dict: dict, threshold: float = 1.0) -> dict:
 
     valid_fns = [
         fn for fn in frame_numbers[:max_valid_frame]
-        if np.mean(raw_dict[fn] > 200.0) < 0.02 and np.sum(raw_dict[fn] > threshold) >= CONTACT_AREA_MIN
+        if np.mean(raw_dict[fn] > 500.0) < 0.02 and np.sum(raw_dict[fn] > threshold) >= CONTACT_AREA_MIN
     ]
     if not valid_fns:
         valid_fns = frame_numbers[:min(50, num_frames)]
@@ -276,7 +309,7 @@ def _trim_frames(raw_dict: dict, threshold: float = 1.0) -> dict:
 
     # Calculate load per frame to find peak contact frame
     valid_loads = [
-        float(np.sum(raw_dict[fn][(raw_dict[fn] > threshold) & (raw_dict[fn] < 200.0)]))
+        float(np.sum(raw_dict[fn][(raw_dict[fn] > threshold) & (raw_dict[fn] < 600.0)]))
         for fn in valid_fns
     ]
     peak_sub_idx = int(np.argmax(valid_loads))
@@ -290,8 +323,6 @@ def _trim_frames(raw_dict: dict, threshold: float = 1.0) -> dict:
     return {fn: raw_dict[fn] for fn in playback_fns}
 
 
-
-
 def _frame_metrics_13(
     arr: np.ndarray,
     frame_number: int,
@@ -301,12 +332,12 @@ def _frame_metrics_13(
     sensel_h_mm: float,
     vmax_psi: float,
 ) -> dict:
-    """Compute all 13 standard tyre parameters for a frame."""
-    mask   = arr > threshold
+    """Compute all 13 standard tyre parameters for a frame using segmented contact patch."""
+    mask = _segment_contact(arr, threshold)
     active = int(np.sum(mask))
 
     sensel_area_mm2 = sensel_w_mm * sensel_h_mm
-    peak_psi = float(np.max(arr)) if active > 0 else 0.0
+    peak_psi = float(np.max(arr[mask])) if active > 0 else 0.0
     avg_psi  = float(np.mean(arr[mask])) if active > 0 else 0.0
 
     contact_area_mm2 = active * sensel_area_mm2
@@ -439,27 +470,22 @@ def _contact_patch_exact(
     sensel_w_mm: float,
     sensel_h_mm: float,
 ) -> dict:
-    """Compute the exact tyre contact outline (per-row edge points) + bounding box.
-
-    Returns a dictionary with:
-      - width_mm, length_mm  : bounding-box dimensions
-      - bbox                 : [col_min, row_min_orig, col_max, row_max_orig] in
-                               origin-lower (XSENSOR convention)
-      - outline_points       : list of {x, y} in canvas sensel coords (origin-upper,
-                               as returned after _serialise_frame flip).
-                               These trace the exact outer edge of the contact patch.
     """
-    mask = arr > threshold
-    rows_any = np.any(mask, axis=1)
-    cols_any = np.any(mask, axis=0)
+    Compute exact tyre contact contour(s) using OpenCV findContours on segmented mask.
+    Returns clean outer contours without bounding box distortions or stray lines.
+    """
+    clean_mask = _segment_contact(arr, threshold)
+    H, W = arr.shape
 
-    if not rows_any.any():
+    if not np.any(clean_mask):
         return {
             "width_mm": 0, "length_mm": 0,
             "bbox": [0, 0, 0, 0],
             "outline_points": [],
         }
 
+    rows_any = np.any(clean_mask, axis=1)
+    cols_any = np.any(clean_mask, axis=0)
     row_min = int(np.argmax(rows_any))
     row_max = int(len(rows_any) - 1 - np.argmax(rows_any[::-1]))
     col_min = int(np.argmax(cols_any))
@@ -468,50 +494,27 @@ def _contact_patch_exact(
     length_mm = round((row_max - row_min + 1) * sensel_h_mm, 1)
     width_mm  = round((col_max - col_min + 1) * sensel_w_mm, 1)
 
-    H = arr.shape[0]
+    contours, _ = cv2.findContours(
+        clean_mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_TC89_KCOS
+    )
 
-    # Build exact outline by tracing left and right edges of each row,
-    # then top and bottom edges of each column.
-    outline: list[dict] = []
-
-    # Right-side outline (left edge going down, then right edge going up)
-    left_edge: list[tuple[int, int]] = []
-    right_edge: list[tuple[int, int]] = []
-
-    for r in range(row_min, row_max + 1):
-        row_mask = mask[r, :]
-        if not np.any(row_mask):
+    outline_contours = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) < 10:
             continue
-        c_l = int(np.argmax(row_mask))
-        c_r = int(len(row_mask) - 1 - np.argmax(row_mask[::-1]))
-        # canvas y = H - 1 - r  (flip because _serialise_frame uses flipud)
-        canvas_y = H - 1 - r
-        left_edge.append((c_l, canvas_y))
-        right_edge.append((c_r, canvas_y))
+        approx = cv2.approxPolyDP(cnt, epsilon=0.5, closed=True)
+        points = []
+        for pt in approx:
+            c, r = int(pt[0][0]), int(pt[0][1])
+            # canvas y = H - 1 - r (due to np.flipud in _serialise_frame)
+            points.append({"x": c, "y": H - 1 - r})
+        if len(points) >= 3:
+            outline_contours.append(points)
 
-    # Combine: left edge top→bottom, right edge bottom→top = closed polygon
-    outline_points = [{"x": x, "y": y} for x, y in left_edge]
-    outline_points += [{"x": x, "y": y} for x, y in reversed(right_edge)]
+    outline_points = outline_contours[0] if len(outline_contours) == 1 else outline_contours
 
-    # Also add top and bottom edges (col scan)
-    top_edge: list[tuple[int, int]] = []
-    bot_edge: list[tuple[int, int]] = []
-    for c in range(col_min, col_max + 1):
-        col_mask = mask[:, c]
-        if not np.any(col_mask):
-            continue
-        r_top = int(np.argmax(col_mask))
-        r_bot = int(len(col_mask) - 1 - np.argmax(col_mask[::-1]))
-        top_edge.append((c, H - 1 - r_top))
-        bot_edge.append((c, H - 1 - r_bot))
-
-    # Final outline: combine left + top + right + bottom for a polygon
-    # Simplified: use left/right edge polygon which gives the clean shape
-    # (top/bottom edges fill in, but for stroke outline the left+right is enough)
-    outline_points = [{"x": x, "y": y} for x, y in left_edge]
-    outline_points += [{"x": x, "y": y} for x, y in reversed(right_edge)]
-
-    # bbox in origin-lower convention (for backend compatibility)
     orig_r0 = H - 1 - row_max
     orig_r1 = H - 1 - row_min
     bbox = [col_min, orig_r0, col_max, orig_r1]

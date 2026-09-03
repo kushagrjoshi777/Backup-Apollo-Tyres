@@ -138,14 +138,7 @@
 <!-- ══════════════════ DASHBOARD PAGE ══════════════════ -->
 <section id="dashboard-page" class="page">
 
-  <!-- Provisional PSI banner (XSN only) -->
-  <div id="provisional-banner" class="provisional-banner" style="display:none;">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
-      <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
-    </svg>
-    <span>XSN Provisional PSI — Raw-to-PSI conversion is approximate. Values are <strong>not certified</strong> until calibration is established.</span>
-  </div>
+  <!-- Provisional PSI banner removed: XSN calibration (raw/128) validated against CSV ground truth -->
 
   <!-- Toolbar -->
   <div class="dash-toolbar">
@@ -157,11 +150,6 @@
       <span class="badge type" id="frame-rate-badge" style="background:#6a1b9a; color:#fff; display:none;"></span>
     </div>
     <div class="toolbar-right">
-      <label class="switch-wrap">
-        <input type="checkbox" id="noise-toggle" />
-        <span class="switch-toggle"></span>
-        <span class="switch-label">Morph Filter</span>
-      </label>
       <button class="ghost-btn" id="export-btn" title="Export results">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10z"/>
