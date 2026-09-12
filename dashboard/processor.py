@@ -649,15 +649,16 @@ def _frame_metrics_13(
     """Compute all standard tyre footprint parameters per Apollo Tyres reference spec.
 
     Reference definitions:
-      FP Width W  — width at the centre of FP (centre row)
-      FP Length L — length at the centre of FP (centre column)
-      S1/S2       — shoulder lengths at 10% inset from tread edges
-      Squareness  — (S1/L)*100, (S2/L)*100
+      FP Width W  — transverse width at the centre of FP (shoulder-to-shoulder)
+      FP Length L — longitudinal length at the centre of FP (rolling direction)
+      S1/S2       — shoulder contact lengths at 10% inset from outer tread edges
+      Squareness  — (S1/L)*100, (S2/L)*100, and Avg Squareness
       PA          — perimeter area (convex hull enclosing footprint)
       CA          — contact area (active sensels only, excludes grooves)
       Contact Ratio — (CA / PA) * 100
     """
-    mask = _segment_contact(arr, threshold)
+    proc_thresh = max(threshold, 8.0) if threshold <= 5.0 else threshold
+    mask = _segment_contact(arr, proc_thresh)
     active = int(np.sum(mask))
 
     sensel_area_mm2 = sensel_w_mm * sensel_h_mm
@@ -672,7 +673,7 @@ def _frame_metrics_13(
     rows_any = np.any(mask, axis=1)
     cols_any = np.any(mask, axis=0)
 
-    if not rows_any.any():
+    if not rows_any.any() or not cols_any.any():
         return {
             "frame_number":         frame_number,
             "contact_area_mm2":     0.0,
@@ -702,123 +703,133 @@ def _frame_metrics_13(
     c_min = int(np.argmax(cols_any))
     c_max = int(len(cols_any) - 1 - np.argmax(cols_any[::-1]))
 
-    bbox_h_sensels = r_max - r_min + 1
-    bbox_w_sensels = c_max - c_min + 1
+    height_span_mm = (r_max - r_min + 1) * sensel_h_mm
+    width_span_mm = (c_max - c_min + 1) * sensel_w_mm
 
-    # ── FP Width W: width at the CENTRE row of the footprint ──────────
-    r_mid = (r_min + r_max) // 2
-    centre_row_mask = mask[r_mid, :]
-    if np.any(centre_row_mask):
-        cr_cmin = int(np.argmax(centre_row_mask))
-        cr_cmax = int(len(centre_row_mask) - 1 - np.argmax(centre_row_mask[::-1]))
-        fp_width_sensels = cr_cmax - cr_cmin + 1
-    else:
-        fp_width_sensels = bbox_w_sensels  # fallback to bbox
-    fp_width_mm = round(fp_width_sensels * sensel_w_mm, 1)
+    is_horizontal_roll = width_span_mm > height_span_mm
 
-    # ── FP Length L: length at the CENTRE column of the footprint ─────
-    c_mid = (c_min + c_max) // 2
-    centre_col_mask = mask[:, c_mid]
-    if np.any(centre_col_mask):
-        cc_rmin = int(np.argmax(centre_col_mask))
-        cc_rmax = int(len(centre_col_mask) - 1 - np.argmax(centre_col_mask[::-1]))
-        fp_length_sensels = cc_rmax - cc_rmin + 1
-    else:
-        fp_length_sensels = bbox_h_sensels  # fallback to bbox
-    fp_length_mm = round(fp_length_sensels * sensel_h_mm, 1)
+    if is_horizontal_roll:
+        c_mid = (c_min + c_max) // 2
+        r_mid = (r_min + r_max) // 2
 
-    # ── Per-column contact lengths (for shoulder measurement) ─────────
-    col_lengths_sensels = []
-    max_col_sensels = 0
-    for c in range(c_min, c_max + 1):
-        col_mask = mask[:, c]
+        col_mask = mask[:, c_mid]
         if np.any(col_mask):
-            c_rmin = int(np.argmax(col_mask))
-            c_rmax = int(len(col_mask) - 1 - np.argmax(col_mask[::-1]))
-            c_len = c_rmax - c_rmin + 1
-            col_lengths_sensels.append(c_len)
-            if c_len > max_col_sensels:
-                max_col_sensels = c_len
+            w_span = (len(col_mask) - 1 - np.argmax(col_mask[::-1])) - np.argmax(col_mask) + 1
         else:
-            col_lengths_sensels.append(0)
+            w_span = r_max - r_min + 1
+        fp_width_mm = round(w_span * sensel_h_mm, 1)
 
-    max_length_mm = round(max_col_sensels * sensel_h_mm, 1)
-
-    # ── Per-row contact widths (for max width) ────────────────────────
-    max_row_sensels = 0
-    for r in range(r_min, r_max + 1):
-        row_mask = mask[r, :]
+        row_mask = mask[r_mid, :]
         if np.any(row_mask):
-            r_cmin = int(np.argmax(row_mask))
-            r_cmax = int(len(row_mask) - 1 - np.argmax(row_mask[::-1]))
-            r_w = r_cmax - r_cmin + 1
-            if r_w > max_row_sensels:
-                max_row_sensels = r_w
-    max_width_mm = round(max_row_sensels * sensel_w_mm, 1)
+            l_span = (len(row_mask) - 1 - np.argmax(row_mask[::-1])) - np.argmax(row_mask) + 1
+        else:
+            l_span = c_max - c_min + 1
+        fp_length_mm = round(l_span * sensel_w_mm, 1)
 
-    # ── Shoulder S1 / S2: measured at 10% inset from edges ────────────
-    # Reference: "10% inside from the edges of the tread towards the centre"
-    # S1 = contact length at the column 10% inside from the outer edge
-    # S2 = contact length at the column 10% inside from the inner edge
-    n_cols = len(col_lengths_sensels)
-    inset_10pct = max(1, int(round(0.10 * n_cols)))
+        max_w_sens = max([(len(mask[:, c]) - 1 - np.argmax(mask[:, c][::-1])) - np.argmax(mask[:, c]) + 1 
+                          for c in range(c_min, c_max + 1) if np.any(mask[:, c])], default=r_max - r_min + 1)
+        max_l_sens = max([(len(mask[r, :]) - 1 - np.argmax(mask[r, :][::-1])) - np.argmax(mask[r, :]) + 1 
+                          for r in range(r_min, r_max + 1) if np.any(mask[r, :])], default=c_max - c_min + 1)
 
-    # Average a small neighbourhood around the 10% inset point for stability
-    def _shoulder_length_at_inset(col_lens, inset_idx):
-        """Get shoulder length at inset position, averaging ±1 column for stability."""
-        start = max(0, inset_idx - 1)
-        end = min(len(col_lens), inset_idx + 2)
-        vals = [col_lens[i] for i in range(start, end) if col_lens[i] > 0]
-        return float(np.mean(vals)) * sensel_h_mm if vals else 0.0
+        max_width_mm = round(max_w_sens * sensel_h_mm, 1)
+        max_length_mm = round(max_l_sens * sensel_w_mm, 1)
 
-    left_inset_idx = inset_10pct  # 10% from left edge
-    right_inset_idx = n_cols - 1 - inset_10pct  # 10% from right edge
+        n_transverse = r_max - r_min + 1
+        inset = max(1, int(round(0.10 * n_transverse)))
+        r_s1 = min(r_max, r_min + inset)
+        r_s2 = max(r_min, r_max - inset)
 
-    left_s_mm = _shoulder_length_at_inset(col_lengths_sensels, left_inset_idx)
-    right_s_mm = _shoulder_length_at_inset(col_lengths_sensels, right_inset_idx)
+        def _get_row_rolling_length(row_idx):
+            rm = mask[row_idx, :]
+            if not np.any(rm): return 0.0
+            span = (len(rm) - 1 - np.argmax(rm[::-1])) - np.argmax(rm) + 1
+            return float(span * sensel_w_mm)
 
-    # FL & RL (Left of car): Outer = Left, Inner = Right
-    # FR & RR (Right of car): Outer = Right, Inner = Left
-    if position in ("FL", "RL"):
-        s1 = round(left_s_mm, 1)   # Outer shoulder
-        s2 = round(right_s_mm, 1)  # Inner shoulder
+        s_top = _get_row_rolling_length(r_s1)
+        s_bot = _get_row_rolling_length(r_s2)
+
+        if position in ("FL", "RL"):
+            s1, s2 = round(s_top, 1), round(s_bot, 1)
+        else:
+            s1, s2 = round(s_bot, 1), round(s_top, 1)
+
     else:
-        s1 = round(right_s_mm, 1)  # Outer shoulder
-        s2 = round(left_s_mm, 1)   # Inner shoulder
+        c_mid = (c_min + c_max) // 2
+        r_mid = (r_min + r_max) // 2
 
-    # ── Shoulder Skewness: ((S1 - S2) / Avg(S1, S2)) * 100 ──────────
-    s_avg_val = (s1 + s2) / 2.0
-    shoulder_skewness_pct = round(((s1 - s2) / s_avg_val) * 100.0, 1) if s_avg_val > 0 else 0.0
+        row_mask = mask[r_mid, :]
+        if np.any(row_mask):
+            w_span = (len(row_mask) - 1 - np.argmax(row_mask[::-1])) - np.argmax(row_mask) + 1
+        else:
+            w_span = c_max - c_min + 1
+        fp_width_mm = round(w_span * sensel_w_mm, 1)
 
-    # ── Squareness: (S1/L)*100, (S2/L)*100, (Avg/L)*100 ─────────────
-    # Reference: L is the centre length (fp_length_mm)
-    squareness_s1_pct = round((s1 / fp_length_mm) * 100.0, 1) if fp_length_mm > 0 else 0.0
-    squareness_s2_pct = round((s2 / fp_length_mm) * 100.0, 1) if fp_length_mm > 0 else 0.0
-    squareness_avg_pct = round((s_avg_val / fp_length_mm) * 100.0, 1) if fp_length_mm > 0 else 0.0
+        col_mask = mask[:, c_mid]
+        if np.any(col_mask):
+            l_span = (len(col_mask) - 1 - np.argmax(col_mask[::-1])) - np.argmax(col_mask) + 1
+        else:
+            l_span = r_max - r_min + 1
+        fp_length_mm = round(l_span * sensel_h_mm, 1)
 
-    # ── Perimeter Area (PA): convex hull enclosing the footprint ─────
-    # PA includes grooves and sipes within the tyre outline
-    active_coords = np.argwhere(mask)  # (N, 2) array of [row, col]
-    if len(active_coords) >= 3:
-        hull = cv2.convexHull(active_coords[:, ::-1].astype(np.float32))  # cv2 wants (x, y)
-        pa_sensels = float(cv2.contourArea(hull))
-        perimeter_area_mm2 = round(pa_sensels * sensel_area_mm2, 1)
+        max_w_sens = max([(len(mask[r, :]) - 1 - np.argmax(mask[r, :][::-1])) - np.argmax(mask[r, :]) + 1 
+                          for r in range(r_min, r_max + 1) if np.any(mask[r, :])], default=c_max - c_min + 1)
+        max_l_sens = max([(len(mask[:, c]) - 1 - np.argmax(mask[:, c][::-1])) - np.argmax(mask[:, c]) + 1 
+                          for c in range(c_min, c_max + 1) if np.any(mask[:, c])], default=r_max - r_min + 1)
+
+        max_width_mm = round(max_w_sens * sensel_w_mm, 1)
+        max_length_mm = round(max_l_sens * sensel_h_mm, 1)
+
+        n_transverse = c_max - c_min + 1
+        inset = max(1, int(round(0.10 * n_transverse)))
+        c_s1 = min(c_max, c_min + inset)
+        c_s2 = max(c_min, c_max - inset)
+
+        def _get_col_rolling_length(col_idx):
+            cm = mask[:, col_idx]
+            if not np.any(cm): return 0.0
+            span = (len(cm) - 1 - np.argmax(cm[::-1])) - np.argmax(cm) + 1
+            return float(span * sensel_h_mm)
+
+        s_left = _get_col_rolling_length(c_s1)
+        s_right = _get_col_rolling_length(c_s2)
+
+        if position in ("FL", "RL"):
+            s1, s2 = round(s_left, 1), round(s_right, 1)
+        else:
+            s1, s2 = round(s_right, 1), round(s_left, 1)
+
+    max_s = max(s1, s2)
+    shoulder_skewness_pct = round((abs(s1 - s2) / max_s) * 100.0, 1) if max_s > 0 else 0.0
+
+    if fp_length_mm > 0:
+        squareness_s1_pct = round((s1 / fp_length_mm) * 100.0, 1)
+        squareness_s2_pct = round((s2 / fp_length_mm) * 100.0, 1)
+        squareness_avg_pct = round(((s1 + s2) / (2.0 * fp_length_mm)) * 100.0, 1)
     else:
-        perimeter_area_mm2 = contact_area_mm2  # fallback
+        squareness_s1_pct = squareness_s2_pct = squareness_avg_pct = 0.0
 
-    # ── Contact Ratio: (CA / PA) * 100 ───────────────────────────────
+    points = np.argwhere(mask)
+    if len(points) >= 3:
+        pts_mm = np.column_stack((points[:, 1] * sensel_w_mm, points[:, 0] * sensel_h_mm)).astype(np.float32)
+        hull = cv2.convexHull(pts_mm)
+        perimeter_area_mm2 = float(cv2.contourArea(hull))
+    else:
+        perimeter_area_mm2 = contact_area_mm2
+
+    perimeter_area_mm2 = max(perimeter_area_mm2, contact_area_mm2)
+
     contact_ratio_pct = round((contact_area_mm2 / perimeter_area_mm2) * 100.0, 1) if perimeter_area_mm2 > 0 else 0.0
 
-    # ── Land/Sea Ratio: CA / (PA - CA) ───────────────────────────────
-    sea_mm2 = perimeter_area_mm2 - contact_area_mm2
-    land_sea_ratio = round(contact_area_mm2 / sea_mm2, 2) if sea_mm2 > 0 else 0.0
+    sea_area = perimeter_area_mm2 - contact_area_mm2
+    land_sea_ratio = round(contact_area_mm2 / sea_area, 2) if sea_area > 0 else 0.0
 
-    total_sensels = arr.shape[0] * arr.shape[1]
+    total_sensels = arr.size
+    contact_pct = round((active / total_sensels) * 100.0, 2) if total_sensels > 0 else 0.0
 
     return {
         "frame_number":          frame_number,
         "contact_area_mm2":      round(contact_area_mm2, 1),
-        "perimeter_area_mm2":    perimeter_area_mm2,
+        "perimeter_area_mm2":    round(perimeter_area_mm2, 1),
         "contact_ratio_pct":     contact_ratio_pct,
         "fp_width_mm":           fp_width_mm,
         "fp_length_mm":          fp_length_mm,
@@ -836,7 +847,7 @@ def _frame_metrics_13(
         "avg_pressure_psi":      round(avg_psi, 2),
         "estimated_load_kg":     round(total_load_kg, 1),
         "active_sensels":        active,
-        "contact_pct":           round(100.0 * active / total_sensels, 2),
+        "contact_pct":           contact_pct,
     }
 
 
