@@ -10,6 +10,7 @@ import json
 import threading
 import base64
 import io
+import csv
 from datetime import datetime
 
 # Ensure stdout/stderr handles UTF-8 safely on Windows
@@ -161,6 +162,119 @@ def export_pdf(job_id):
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/pixel/<job_id>", methods=["POST"])
+def pixel_inspector(job_id):
+    """Pixel inspector endpoint. Returns values and flags for a specific pixel and its neighbourhood."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if job is None or job.get("status") != "done":
+        return jsonify({"error": "Job not found or not ready"}), 404
+
+    data = request.get_json() or {}
+    frame_number = data.get("frame_number")
+    row = data.get("row")
+    col = data.get("col")
+
+    if frame_number is None or row is None or col is None:
+        return jsonify({"error": "Missing frame_number, row, or col"}), 400
+
+    result = job["result"]
+    pixel_data = result.get("pixel_data")
+    if not pixel_data:
+        return jsonify({"error": "Pixel data not available"}), 404
+
+    # The pixel_data stores flat arrays.
+    cols = pixel_data.get("grid_cols", 256)
+    idx = row * cols + col
+    
+    if idx < 0 or idx >= cols * pixel_data.get("grid_rows", 256):
+        return jsonify({"error": "Row or col out of bounds"}), 400
+
+    # Retrieve values safely
+    raw_val = pixel_data.get("best_frame_raw", [])[idx] if len(pixel_data.get("best_frame_raw", [])) > idx else None
+    cal_val = pixel_data.get("best_frame_calibrated", [])[idx] if len(pixel_data.get("best_frame_calibrated", [])) > idx else None
+    filtered_val = pixel_data.get("best_frame_filtered", [])[idx] if len(pixel_data.get("best_frame_filtered", [])) > idx else None
+    final_val = pixel_data.get("best_frame_final", [])[idx] if len(pixel_data.get("best_frame_final", [])) > idx else None
+
+    invalid = pixel_data.get("invalid_mask", [])[idx] if len(pixel_data.get("invalid_mask", [])) > idx else False
+    saturated = pixel_data.get("saturation_mask", [])[idx] if len(pixel_data.get("saturation_mask", [])) > idx else False
+    spiked = pixel_data.get("spike_mask", [])[idx] if len(pixel_data.get("spike_mask", [])) > idx else False
+    contact = pixel_data.get("contact_mask", [])[idx] if len(pixel_data.get("contact_mask", [])) > idx else False
+
+    # Get 3x3 neighbourhood of final values
+    neighbourhood = []
+    rows = pixel_data.get("grid_rows", 256)
+    final_arr = pixel_data.get("best_frame_final", [])
+    if final_arr:
+        for r in range(max(0, row - 1), min(rows, row + 2)):
+            nrow = []
+            for c in range(max(0, col - 1), min(cols, col + 2)):
+                nidx = r * cols + c
+                nrow.append(final_arr[nidx] if nidx < len(final_arr) else 0)
+            neighbourhood.append(nrow)
+            
+    return jsonify({
+        "raw_value": raw_val,
+        "calibrated_psi": cal_val,
+        "filtered_psi": filtered_val,
+        "final_psi": final_val,
+        "flags": {
+            "invalid": bool(invalid),
+            "saturated": bool(saturated),
+            "spatial_spike": bool(spiked),
+            "in_contact_patch": bool(contact)
+        },
+        "neighbourhood_3x3": neighbourhood
+    })
+
+@app.route("/diagnostics/<job_id>", methods=["GET"])
+def get_diagnostics(job_id):
+    """Return frame diagnostics array."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if job is None or job.get("status") != "done":
+        return jsonify({"error": "Job not found or not ready"}), 404
+
+    return jsonify(job["result"].get("frame_diagnostics", []))
+
+@app.route("/diagnostics/csv/<job_id>", methods=["GET"])
+def get_diagnostics_csv(job_id):
+    """Return frame diagnostics as CSV file download."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if job is None or job.get("status") != "done":
+        return jsonify({"error": "Job not found or not ready"}), 404
+
+    diags = job["result"].get("frame_diagnostics", [])
+    if not diags:
+        return jsonify({"error": "No diagnostics available"}), 404
+        
+    si = io.StringIO()
+    writer = csv.DictWriter(si, fieldnames=diags[0].keys())
+    writer.writeheader()
+    writer.writerows(diags)
+    
+    return send_file(
+        io.BytesIO(si.getvalue().encode('utf-8')),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=f"diagnostics_{job_id}.csv"
+    )
+
+@app.route("/calibration/<job_id>", methods=["GET"])
+def get_calibration(job_id):
+    """Return calibration audit dict."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+    if job is None or job.get("status") != "done":
+        return jsonify({"error": "Job not found or not ready"}), 404
+
+    return jsonify(job["result"].get("calibration_audit", {}))
 
 
 # ── Background worker ─────────────────────────────────────────────────────────

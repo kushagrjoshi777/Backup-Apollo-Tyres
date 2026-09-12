@@ -284,30 +284,36 @@
           <div class="metric-unit">%</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">8. Squareness (S1/S2)</div>
-          <div class="metric-value" id="m-sq-ratio">—</div>
+          <div class="metric-label">8. Squareness S1 (S1/L)</div>
+          <div class="metric-value" id="m-sq-s1">—</div>
           <div class="metric-unit">%</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">9. Squareness (Avg)</div>
-          <div class="metric-value" id="m-sq-avg">—</div>
+          <div class="metric-label">9. Squareness S2 (S2/L)</div>
+          <div class="metric-value" id="m-sq-s2">—</div>
+          <div class="metric-unit">%</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">10. Land/Sea Ratio</div>
+          <div class="metric-label">10. Squareness (Avg)</div>
+          <div class="metric-value" id="m-sq-avg">—</div>
+          <div class="metric-unit">%</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">11. Land/Sea Ratio</div>
           <div class="metric-value" id="m-ls-ratio">—</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">11. Contact Pressure</div>
+          <div class="metric-label">12. Contact Pressure</div>
           <div class="metric-value" id="m-avg">—</div>
           <div class="metric-unit" id="psi-unit-label">PSI</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">12. Max Length</div>
+          <div class="metric-label">13. Max Length</div>
           <div class="metric-value" id="m-max-l">—</div>
           <div class="metric-unit">mm</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">13. Max Width</div>
+          <div class="metric-label">14. Max Width</div>
           <div class="metric-value" id="m-max-w">—</div>
           <div class="metric-unit">mm</div>
         </div>
@@ -354,6 +360,128 @@
           <span id="vmin-label">0</span><span id="vmid-label">110</span><span id="vmax-label">220</span>
           <span class="tick-unit">PSI</span>
         </div>
+      </div>
+    </div>
+
+    <!-- ── PANEL E: Pixel Inspector ── -->
+    <div class="panel panel-inspector" id="inspector-panel">
+      <div class="panel-header">
+        <span class="panel-title">Pixel Inspector</span>
+        <span class="panel-tag" id="inspector-status">Click heatmap or enter coordinates</span>
+      </div>
+      <div class="inspector-controls">
+        <div class="inspector-inputs">
+          <label class="inspector-label">Row</label>
+          <input type="number" id="inspect-row" min="0" max="255" value="128" class="input-control inspector-input" />
+          <label class="inspector-label">Col</label>
+          <input type="number" id="inspect-col" min="0" max="255" value="128" class="input-control inspector-input" />
+          <label class="inspector-label">Frame</label>
+          <input type="number" id="inspect-frame" min="0" class="input-control inspector-input" />
+          <button class="ghost-btn" id="inspect-btn">Inspect</button>
+        </div>
+      </div>
+      <div id="inspector-result" class="inspector-result hidden">
+        <div class="inspector-grid">
+          <div class="inspector-section">
+            <div class="inspector-section-title">Raw Data</div>
+            <div class="inspector-row"><span class="inspector-key">Raw Value</span><span class="inspector-val" id="px-raw">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Raw Dtype</span><span class="inspector-val" id="px-dtype">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Invalid</span><span class="inspector-val" id="px-invalid">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Saturated</span><span class="inspector-val" id="px-saturated">—</span></div>
+          </div>
+          <div class="inspector-section">
+            <div class="inspector-section-title">Calibration</div>
+            <div class="inspector-row"><span class="inspector-key">Method</span><span class="inspector-val" id="px-cal-method">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Range</span><span class="inspector-val" id="px-cal-range">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Calibrated PSI</span><span class="inspector-val" id="px-cal-psi">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Confidence</span><span class="inspector-val" id="px-confidence">—</span></div>
+          </div>
+          <div class="inspector-section">
+            <div class="inspector-section-title">Filtering</div>
+            <div class="inspector-row"><span class="inspector-key">Temporal Spike</span><span class="inspector-val" id="px-temporal">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Spatial Spike</span><span class="inspector-val" id="px-spatial">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">FFT Output</span><span class="inspector-val" id="px-fft">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Patch Status</span><span class="inspector-val" id="px-patch">—</span></div>
+          </div>
+          <div class="inspector-section">
+            <div class="inspector-section-title">Final</div>
+            <div class="inspector-row final-row"><span class="inspector-key">Final PSI</span><span class="inspector-val final-val" id="px-final">—</span></div>
+            <div class="inspector-row"><span class="inspector-key">Contact</span><span class="inspector-val" id="px-contact">—</span></div>
+          </div>
+        </div>
+        <div class="neighbourhood-section">
+          <div class="inspector-section-title">3×3 Neighbourhood (PSI)</div>
+          <table class="neighbourhood-table" id="neighbourhood-table">
+            <thead><tr><th></th><th id="nb-c0">C—</th><th id="nb-c1">C—</th><th id="nb-c2">C—</th></tr></thead>
+            <tbody>
+              <tr><td id="nb-r0">R—</td><td id="nb-00">—</td><td id="nb-01">—</td><td id="nb-02">—</td></tr>
+              <tr><td id="nb-r1">R—</td><td id="nb-10">—</td><td class="nb-center" id="nb-11">—</td><td id="nb-12">—</td></tr>
+              <tr><td id="nb-r2">R—</td><td id="nb-20">—</td><td id="nb-21">—</td><td id="nb-22">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── PANEL F: Frame Diagnostics ── -->
+    <div class="panel panel-diagnostics" id="diagnostics-panel">
+      <div class="panel-header">
+        <span class="panel-title">Frame Diagnostics</span>
+        <button class="ghost-btn" id="diag-csv-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Export CSV
+        </button>
+      </div>
+      <div class="diag-table-wrap">
+        <table class="diag-table" id="diag-table">
+          <thead>
+            <tr>
+              <th>Frame</th>
+              <th>Raw Min</th>
+              <th>Raw Max</th>
+              <th>Cal. Min</th>
+              <th>Cal. Max</th>
+              <th>Cal. Mean</th>
+              <th>Cal. P95</th>
+              <th>Active</th>
+              <th>Area mm²</th>
+              <th>Invalid</th>
+              <th>Sat.</th>
+              <th>Spk.S</th>
+              <th>Spk.T</th>
+            </tr>
+          </thead>
+          <tbody id="diag-tbody">
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── PANEL G: Calibration Audit ── -->
+    <div class="panel panel-audit" id="audit-panel">
+      <div class="panel-header">
+        <span class="panel-title">Calibration Audit</span>
+        <span class="panel-tag" id="audit-confidence">—</span>
+      </div>
+      <div class="audit-grid">
+        <div class="audit-row"><span class="audit-key">Sensor</span><span class="audit-val" id="audit-sensor">—</span></div>
+        <div class="audit-row"><span class="audit-key">Vehicle Type</span><span class="audit-val" id="audit-vehicle">—</span></div>
+        <div class="audit-row"><span class="audit-key">Pressure Range</span><span class="audit-val" id="audit-range">—</span></div>
+        <div class="audit-row"><span class="audit-key">Calibration Source</span><span class="audit-val" id="audit-source">—</span></div>
+        <div class="audit-row"><span class="audit-key">Calibration Method</span><span class="audit-val mono" id="audit-method">—</span></div>
+        <div class="audit-row"><span class="audit-key">Raw Domain</span><span class="audit-val mono" id="audit-raw-domain">—</span></div>
+        <div class="audit-row"><span class="audit-key">PSI Domain</span><span class="audit-val mono" id="audit-psi-domain">—</span></div>
+        <div class="audit-row"><span class="audit-key">Scale (1/divisor)</span><span class="audit-val mono" id="audit-scale">—</span></div>
+        <div class="audit-row"><span class="audit-key">Offset</span><span class="audit-val mono" id="audit-offset">—</span></div>
+        <div class="audit-row"><span class="audit-key">Saturated Values</span><span class="audit-val" id="audit-saturated">—</span></div>
+        <div class="audit-row"><span class="audit-key">Invalid Values</span><span class="audit-val" id="audit-invalid">—</span></div>
+        <div class="audit-row"><span class="audit-key">Repaired Spikes</span><span class="audit-val" id="audit-spikes">—</span></div>
+        <div class="audit-row"><span class="audit-key">Baseline Frame</span><span class="audit-val" id="audit-baseline">—</span></div>
+        <div class="audit-row"><span class="audit-key">Calibration Confidence</span><span class="audit-val" id="audit-conf-val">—</span></div>
       </div>
     </div>
 

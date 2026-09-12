@@ -10,6 +10,28 @@ import numpy as np
 from scipy.fft import fft2, ifft2, fftshift, ifftshift
 from scipy.ndimage import median_filter
 import cv2
+import math
+from dataclasses import dataclass, field
+
+@dataclass
+class PipelineConfig:
+    tyre_type: str = "TBR"
+    pressure_ceiling: float = 220.0
+    min_pressure: float = 5.0
+    fft_enabled: bool = True
+    fft_cutoff: float = 0.97
+    fft_filter_strength: int = 2
+    temporal_filter_enabled: bool = True
+    temporal_spike_threshold: float = 3.0
+    spatial_filter_enabled: bool = True  
+    spatial_mad_threshold: float = 4.0
+    patch_filter_enabled: bool = True
+    sensel_area_mm2: float = 2.434
+    min_patch_area_mm2: float = 12.0
+    patch_preserve_threshold_psi: float = 20.0
+    lineout_detection_enabled: bool = False
+    lineout_threshold_pct: float = 50.0
+    baseline_frame_index: int | None = None
 
 # Allow importing from parent src/ directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -97,42 +119,197 @@ def extract_metadata_from_file(filepath: str) -> dict:
 
 def apply_fft_butterworth(
     frame_psi: np.ndarray,
-    keep_ratio: float = 0.97,
-    butterworth_order: int = 2,
-    is_xsn: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+    config: PipelineConfig,
+) -> tuple[np.ndarray, np.ndarray, int, float]:
     """
-    Adaptive despike + 2D Butterworth FFT Lowpass filter.
-    Preserves real pressure peaks (>200-500 PSI) while filtering high-frequency sensor noise.
+    XSENSOR-inspired Fourier noise reduction.
     """
-    # 1. Adaptive despike without hard 200 PSI ceiling
+    if not config.fft_enabled:
+        return frame_psi.copy(), np.zeros_like(frame_psi), 0, 0.0
+        
     med = median_filter(frame_psi, size=3)
     diff = np.abs(frame_psi - med)
     spike_mask = diff > (20.0 + 0.3 * med)
+    spike_mask &= (frame_psi > config.min_pressure)
+    n_spikes = int(np.sum(spike_mask))
+    
     clean_frame = frame_psi.copy()
     clean_frame[spike_mask] = med[spike_mask]
 
-    # 2. Butterworth 2D FFT Filter
     rows, cols = clean_frame.shape
     f_shift = fftshift(fft2(clean_frame.astype(np.float64)))
     cy, cx = rows // 2, cols // 2
     y, x = np.ogrid[-cy : rows - cy, -cx : cols - cx]
     d = np.sqrt(x**2 + y**2)
 
-    # Scale cutoff d0 based on grid Nyquist radius (min(rows, cols) / 2)
     f_nyquist = min(rows, cols) / 2.0
-    d0 = max(10.0, min(f_nyquist * 0.9, keep_ratio * f_nyquist * 0.85))
-    h_butterworth = 1.0 / (1.0 + (d / max(1.0, d0)) ** (2 * butterworth_order))
+    d0 = max(10.0, min(f_nyquist * 0.9, config.fft_cutoff * f_nyquist * 0.85))
+    h_butterworth = 1.0 / (1.0 + (d / max(1.0, d0)) ** (2 * config.fft_filter_strength))
 
     filtered = np.real(ifft2(ifftshift(f_shift * h_butterworth)))
     filtered = np.clip(filtered, 0.0, None)
 
-    # 3. Clean background noise below pressure threshold
-    filtered[filtered < PRESSURE_THRESHOLD] = 0.0
+    filtered[filtered < config.min_pressure] = 0.0
 
     noise = clean_frame - filtered
-    return filtered.astype(np.float32), noise.astype(np.float32)
+    energy_removed = float(np.sum(np.abs(noise)))
+    
+    return filtered.astype(np.float32), noise.astype(np.float32), n_spikes, energy_removed
 
+
+def zero_pressure_baseline(frames: dict[int, np.ndarray], config: PipelineConfig) -> tuple[np.ndarray | None, dict]:
+    """Find and return a zero-pressure baseline frame.
+    
+    Auto-detection: finds frame with fewest active sensels (< 50 above min_pressure).
+    If config.baseline_frame_index is set, uses that specific frame.
+    Returns (baseline_frame_or_None, diagnostics_dict).
+    """
+    diag = {"baseline_frame_index": None, "baseline_min": 0, "baseline_max": 0, 
+            "baseline_mean": 0, "baseline_p95": 0, "baseline_p99": 0, "method": "none"}
+    
+    if config.baseline_frame_index is not None:
+        idx = config.baseline_frame_index
+        if idx in frames:
+            bl = frames[idx].astype(np.float32)
+            diag.update({"baseline_frame_index": idx, "method": "manual",
+                         "baseline_min": float(np.min(bl)), "baseline_max": float(np.max(bl)),
+                         "baseline_mean": float(np.mean(bl)), 
+                         "baseline_p95": float(np.percentile(bl, 95)),
+                         "baseline_p99": float(np.percentile(bl, 99))})
+            return bl, diag
+    
+    sorted_keys = sorted(frames.keys())
+    min_active = float('inf')
+    best_bl_idx = None
+    for k in sorted_keys[:20]:
+        active = int(np.sum(frames[k] > config.min_pressure))
+        if active < min_active:
+            min_active = active
+            best_bl_idx = k
+    
+    if best_bl_idx is not None and min_active < 50:
+        bl = frames[best_bl_idx].astype(np.float32)
+        diag.update({"baseline_frame_index": best_bl_idx, "method": "auto_min_contact",
+                     "baseline_min": float(np.min(bl)), "baseline_max": float(np.max(bl)),
+                     "baseline_mean": float(np.mean(bl)),
+                     "baseline_p95": float(np.percentile(bl, 95)),
+                     "baseline_p99": float(np.percentile(bl, 99))})
+        return bl, diag
+    
+    return None, diag
+
+def temporal_antispeckle(frames_dict: dict[int, np.ndarray], config: PipelineConfig) -> tuple[dict[int, np.ndarray], dict]:
+    """Temporal consistency check across consecutive frames.
+    
+    For each sensel, if current value deviates extremely from temporal neighbours,
+    replace with spatial 8-neighbour median estimate.
+    """
+    keys = sorted(frames_dict.keys())
+    result = {}
+    total_spikes = 0
+    total_repaired = 0
+    
+    for idx_i, k in enumerate(keys):
+        current = frames_dict[k].copy()
+        
+        if not config.temporal_filter_enabled or len(keys) < 3:
+            result[k] = current
+            continue
+        
+        prev_frame = frames_dict[keys[max(0, idx_i - 1)]]
+        next_frame = frames_dict[keys[min(len(keys) - 1, idx_i + 1)]]
+        
+        stack = np.stack([prev_frame, current, next_frame], axis=0)
+        temporal_median = np.median(stack, axis=0)
+        temporal_std = np.std(stack, axis=0)
+        
+        safe_std = np.maximum(temporal_std, 5.0)
+        deviation = np.abs(current - temporal_median)
+        spike_mask = deviation > (config.temporal_spike_threshold * safe_std)
+        spike_mask &= (current > config.min_pressure)
+        
+        n_spikes = int(np.sum(spike_mask))
+        total_spikes += n_spikes
+        
+        if n_spikes > 0:
+            spatial_med = median_filter(current, size=3)
+            current[spike_mask] = spatial_med[spike_mask]
+            total_repaired += n_spikes
+        
+        result[k] = current
+    
+    diag = {"temporal_spikes_detected": total_spikes, "temporal_spikes_repaired": total_repaired}
+    return result, diag
+
+def spatial_spike_filter(frame: np.ndarray, config: PipelineConfig) -> tuple[np.ndarray, int]:
+    """Conservative 3x3 spatial outlier detection using Median Absolute Deviation.
+    
+    Preserves tread ribs, grooves, and legitimate pressure gradients.
+    Only replaces genuinely inconsistent isolated values.
+    """
+    if not config.spatial_filter_enabled:
+        return frame.copy(), 0
+    
+    result = frame.copy()
+    med = median_filter(frame, size=3)
+    
+    diff = np.abs(frame - med)
+    mad = median_filter(diff, size=3)
+    mad_safe = np.maximum(mad, 2.0)
+    
+    spike_mask = diff > (config.spatial_mad_threshold * mad_safe)
+    spike_mask &= (frame > config.min_pressure)
+    
+    n_spikes = int(np.sum(spike_mask))
+    if n_spikes > 0:
+        result[spike_mask] = med[spike_mask]
+    
+    return result, n_spikes
+
+def sensel_patch_filter(frame: np.ndarray, config: PipelineConfig) -> tuple[np.ndarray, dict]:
+    """XSENSOR-inspired sensel patch filtering.
+    
+    Remove tiny isolated patches while preserving patches with high pressure.
+    Uses 8-connected component analysis.
+    """
+    if not config.patch_filter_enabled:
+        return frame.copy(), {"patches_detected": 0, "patches_removed": 0, 
+                               "sensels_removed": 0, "sensels_preserved_by_pressure": 0}
+    
+    threshold_count = math.ceil(config.min_patch_area_mm2 / config.sensel_area_mm2)
+    
+    binary = (frame >= config.min_pressure).astype(np.uint8)
+    if not np.any(binary):
+        return frame.copy(), {"patches_detected": 0, "patches_removed": 0,
+                               "sensels_removed": 0, "sensels_preserved_by_pressure": 0}
+    
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    
+    result = frame.copy()
+    patches_detected = num_labels - 1
+    patches_removed = 0
+    sensels_removed = 0
+    sensels_preserved = 0
+    
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < threshold_count:
+            component_mask = (labels == i)
+            max_pressure_in_patch = float(np.max(frame[component_mask]))
+            if max_pressure_in_patch < config.patch_preserve_threshold_psi:
+                result[component_mask] = 0.0
+                patches_removed += 1
+                sensels_removed += area
+            else:
+                sensels_preserved += area
+                
+    diag = {
+        "patches_detected": patches_detected,
+        "patches_removed": patches_removed,
+        "sensels_removed": sensels_removed,
+        "sensels_preserved_by_pressure": sensels_preserved,
+    }
+    return result, diag
 
 def _segment_contact(
     arr: np.ndarray,
@@ -184,11 +361,11 @@ def load_and_process(
     fft_keep_ratio: float = 0.97,
 ) -> dict:
     """
-    Full pipeline: parse (CSV or XSN) → trim → FFT filter → 13 metrics → serialise.
+    Full pipeline: parse (CSV or XSN) → calibrate → baseline → saturation handling → 
+    temporal filter → spatial filter → FFT → patch filter → metrics → serialise.
     """
     vmax_psi = max_pressure
 
-    # Extract metadata
     meta = extract_metadata_from_file(filepath)
     if speed == 0.0 and meta["speed"] > 0:
         speed = meta["speed"]
@@ -198,50 +375,126 @@ def load_and_process(
 
     sensel_w = meta.get("sensel_width_mm", DEFAULT_SENSEL_MM)
     sensel_h = meta.get("sensel_height_mm", DEFAULT_SENSEL_MM)
+    sensel_area_mm2 = sensel_w * sensel_h
 
-    # Parse file (CSV or XSN)
     is_xsn = meta["is_xsn"]
-    parsed = parse_file_extended(filepath, max_frames=MAX_XSN_FRAMES)
-    raw_frames     = parsed["frames"]
+    
+    config = PipelineConfig(
+        tyre_type=tyre_type.upper(),
+        pressure_ceiling=max_pressure,
+        min_pressure=min_pressure,
+        fft_enabled=True,
+        fft_cutoff=fft_keep_ratio,
+        sensel_area_mm2=sensel_area_mm2,
+    )
+
+    parsed = parse_file_extended(filepath, max_frames=MAX_XSN_FRAMES, tyre_type=config.tyre_type, pressure_ceiling=config.pressure_ceiling)
+    calibrated_frames = parsed["frames"]
+    raw_frames = parsed.get("raw_frames", {})
+    calibration_results = parsed.get("calibration_results", {})
     xsn_frame_rate = parsed.get("frame_rate")
     is_provisional = parsed.get("is_provisional", False)
-    total_frames   = parsed.get("total_frames", len(raw_frames))
+    total_frames = parsed.get("total_frames", len(calibrated_frames))
+    raw_diagnostics = parsed.get("raw_diagnostics", {})
 
-    # ── [XSN-DIAG] Processor traceability ─────────────────────────────────
-    print(f"[XSN-DIAG] processor.load_and_process()")
-    print(f"[XSN-DIAG]   is_xsn       : {is_xsn}")
-    print(f"[XSN-DIAG]   parser used   : src.parser.parse_file_extended -> {'parse_xsn_lazy' if is_xsn else 'parse_xsensor_csv'}")
-    print(f"[XSN-DIAG]   raw frames    : {len(raw_frames)}")
-    print(f"[XSN-DIAG]   is_provisional: {is_provisional}")
-    print(f"[XSN-DIAG]   frame_rate    : {xsn_frame_rate}")
-    if raw_frames:
-        fk = sorted(raw_frames.keys())
-        f0 = raw_frames[fk[0]]
-        print(f"[XSN-DIAG]   frame[{fk[0]}] verify: shape={f0.shape} min={f0.min():.4f} max={f0.max():.4f} mean={f0.mean():.4f}")
-    # ─────────────────────────────────────────────────────────────────────
-
-    if not raw_frames:
+    if not calibrated_frames:
         raise ValueError("No frames found in the file.")
 
-    # 1. Select valid frames & 50-frame playback window centered around peak contact
-    trimmed = _trim_frames(raw_frames, min_pressure)
+    # 1. Zero-pressure baseline
+    baseline_frame, baseline_diag = zero_pressure_baseline(calibrated_frames, config)
+    if baseline_frame is not None:
+        for k in calibrated_frames:
+            calibrated_frames[k] = np.maximum(calibrated_frames[k] - baseline_frame, 0.0)
+
+    # 2. Select valid frames & 50-frame playback window
+    trimmed = _trim_frames(calibrated_frames, config.pressure_ceiling, min_pressure)
     if not trimmed:
-        trimmed = raw_frames
+        trimmed = calibrated_frames
 
     frame_numbers = sorted(trimmed.keys())
+    
+    # 3. Temporal Anti-speckle (only on playback window)
+    playback_frames = {fn: trimmed[fn] for fn in frame_numbers}
+    temporal_filtered, temporal_diag = temporal_antispeckle(playback_frames, config)
 
-    # 2. Apply FFT noise reduction + contact segmentation to all frames
-    filtered_frames: dict = {}
+    # Pipeline processing and diagnostics
+    filtered_frames = {}
+    pixel_data_store = {}
+    frame_diagnostics = []
+    
+    total_repaired_spikes = temporal_diag.get("temporal_spikes_repaired", 0)
+    total_invalid = 0
+    total_saturated = 0
+
     for fn in frame_numbers:
-        arr = trimmed[fn]
-        if arr.dtype != np.float32:
-            arr = arr.astype(np.float32)
-        filtered, _ = apply_fft_butterworth(arr, keep_ratio=fft_keep_ratio, is_xsn=is_xsn)
-        mask = _segment_contact(filtered, min_pressure)
-        segmented = np.where(mask, filtered, 0.0)
-        filtered_frames[fn] = segmented.astype(np.float32)
+        arr = temporal_filtered[fn]
+        
+        # Diagnostics base
+        raw_min = raw_max = raw_mean = 0.0
+        invalid_count = saturation_count = 0
+        
+        if is_xsn and fn in raw_frames:
+            raw_matrix = raw_frames[fn]
+            flat_raw = raw_matrix.flatten()
+            nonzero_raw = flat_raw[flat_raw > 0]
+            raw_min = float(np.min(nonzero_raw)) if len(nonzero_raw) > 0 else 0.0
+            raw_max = float(np.max(flat_raw))
+            raw_mean = float(np.mean(nonzero_raw)) if len(nonzero_raw) > 0 else 0.0
+            
+            calib_res = calibration_results[fn]
+            invalid_count = int(np.sum(calib_res.invalid_mask))
+            saturation_count = int(np.sum(calib_res.saturation_mask))
+            total_invalid += invalid_count
+            total_saturated += saturation_count
+            
+        flat_cal = arr.flatten()
+        active_cal = flat_cal[flat_cal > config.min_pressure]
+        cal_min = float(np.min(active_cal)) if len(active_cal) > 0 else 0.0
+        cal_max = float(np.max(flat_cal))
+        cal_mean = float(np.mean(active_cal)) if len(active_cal) > 0 else 0.0
+        cal_p95 = float(np.percentile(flat_cal, 95))
+        cal_p98 = float(np.percentile(flat_cal, 98))
+        
+        # 4. Spatial Filter
+        spatial_filtered, n_spatial_spikes = spatial_spike_filter(arr, config)
+        total_repaired_spikes += n_spatial_spikes
+        
+        # 5. FFT
+        fft_filtered, noise, n_fft_spikes, energy_removed = apply_fft_butterworth(spatial_filtered, config)
+        
+        # 6. Patch filter
+        patch_filtered, patch_diag = sensel_patch_filter(fft_filtered, config)
+        
+        # 7. Contact segmentation
+        mask = _segment_contact(patch_filtered, min_pressure)
+        segmented = np.where(mask, patch_filtered, 0.0).astype(np.float32)
+        
+        filtered_frames[fn] = segmented
+        
+        # Store for pixel inspector (just the required fields, we will extract for best frame later)
+        pixel_data_store[fn] = {
+            "spatial_filtered": spatial_filtered,
+            "segmented": segmented,
+            "spatial_spikes": n_spatial_spikes,
+        }
+        
+        # Diagnostics
+        active_sensels = int(np.sum(segmented > config.min_pressure))
+        frame_diagnostics.append({
+            "frame_index": fn,
+            "raw_min": raw_min, "raw_max": raw_max, "raw_mean": raw_mean,
+            "calibrated_min": cal_min, "calibrated_max": cal_max, "calibrated_mean": cal_mean,
+            "calibrated_p95": cal_p95, "calibrated_p98": cal_p98,
+            "active_sensels": active_sensels, 
+            "contact_area_mm2": active_sensels * sensel_area_mm2,
+            "total_load_n": float(np.sum(segmented) * 0.00689476 * sensel_area_mm2),
+            "invalid_count": invalid_count, 
+            "saturation_count": saturation_count,
+            "spatial_spike_count": n_spatial_spikes, 
+            "temporal_spike_count": temporal_diag.get("temporal_spikes_detected", 0) if fn == frame_numbers[0] else 0,
+        })
 
-    # 3. Per-frame 13-parameter metrics (on filtered data)
+    # Metrics
     metrics_list = [
         _frame_metrics_13(
             filtered_frames[fn], fn, min_pressure, position, sensel_w, sensel_h, vmax_psi
@@ -249,19 +502,75 @@ def load_and_process(
         for fn in frame_numbers
     ]
 
-    # 4. Best-contact frame (max contact area)
     best_idx  = int(np.argmax([m["active_sensels"] for m in metrics_list]))
     best_fn   = frame_numbers[best_idx]
     best_arr  = filtered_frames[best_fn]
 
-    # 5. Exact tyre outline (edge-detection based contact patch)
     patch = _contact_patch_exact(best_arr, min_pressure, sensel_w, sensel_h)
 
-    # 6. Serialise filtered frames as flat uint8 arrays (PSI-normalised)
     frames_data = {
         str(fn): _serialise_frame(filtered_frames[fn], vmax_psi)
         for fn in frame_numbers
     }
+    
+    # Build calibration audit
+    calib_audit = {
+        "sensor": "XSENSOR HX510" if is_xsn else "Unknown CSV",
+        "vehicle_type": config.tyre_type,
+        "pressure_range": f"0-{config.pressure_ceiling} PSI",
+        "calibration_source": "Empirical cross-validation with CSV" if is_xsn else "CSV",
+        "calibration_method": parsed.get("calibration_method", "UNKNOWN"),
+        "raw_domain": "uint16 [0, 65535]" if is_xsn else "N/A",
+        "psi_domain": "float32 [0, 511.99]",
+        "offset": 0.0,
+        "scale": 0.0078125 if is_xsn else 1.0,
+        "saturated_values": total_saturated,
+        "invalid_values": total_invalid,
+        "repaired_spikes": total_repaired_spikes,
+        "baseline_frame": baseline_diag.get("baseline_frame_index"),
+        "calibration_confidence": parsed.get("calibration_confidence", "UNKNOWN"),
+    }
+    
+    # Build Pixel data for best frame
+    best_pixel_data = {
+        "grid_rows": 256,
+        "grid_cols": 256,
+        "calibration_method": calib_audit["calibration_method"],
+        "pressure_range": config.tyre_type,
+        "pressure_ceiling": config.pressure_ceiling,
+        "calibration_confidence": calib_audit["calibration_confidence"],
+    }
+    
+    if is_xsn and best_fn in raw_frames and best_fn in calibration_results:
+        best_pixel_data["best_frame_raw"] = raw_frames[best_fn].flatten().tolist()
+        calib_res = calibration_results[best_fn]
+        best_pixel_data["best_frame_calibrated"] = calib_res.calibrated_psi.flatten().tolist()
+        best_pixel_data["invalid_mask"] = calib_res.invalid_mask.flatten().tolist()
+        best_pixel_data["saturation_mask"] = calib_res.saturation_mask.flatten().tolist()
+    else:
+        best_pixel_data["best_frame_raw"] = []
+        best_pixel_data["best_frame_calibrated"] = calibrated_frames[best_fn].flatten().tolist() if best_fn in calibrated_frames else []
+        best_pixel_data["invalid_mask"] = []
+        best_pixel_data["saturation_mask"] = []
+        
+    if best_fn in pixel_data_store:
+        pds = pixel_data_store[best_fn]
+        best_pixel_data["best_frame_filtered"] = pds["spatial_filtered"].flatten().tolist()
+        best_pixel_data["best_frame_final"] = pds["segmented"].flatten().tolist()
+        best_pixel_data["contact_mask"] = (pds["segmented"] > min_pressure).flatten().tolist()
+        
+        # Approximate spike mask
+        if best_fn in calibrated_frames:
+            orig = calibrated_frames[best_fn]
+            diff = np.abs(orig - pds["spatial_filtered"])
+            best_pixel_data["spike_mask"] = (diff > 0.1).flatten().tolist()
+        else:
+            best_pixel_data["spike_mask"] = []
+    else:
+        best_pixel_data["best_frame_filtered"] = []
+        best_pixel_data["best_frame_final"] = []
+        best_pixel_data["contact_mask"] = []
+        best_pixel_data["spike_mask"] = []
 
     return {
         "frame_numbers":     frame_numbers,
@@ -275,7 +584,7 @@ def load_and_process(
         "vmin":              min_pressure,
         "speed":             speed,
         "position":          position,
-        "tyre_type":         tyre_type.upper(),
+        "tyre_type":         config.tyre_type,
         "fft_keep_ratio":    fft_keep_ratio,
         "sensel_w_mm":       sensel_w,
         "sensel_h_mm":       sensel_h,
@@ -283,14 +592,19 @@ def load_and_process(
         "is_provisional":    is_provisional,
         "frame_rate":        xsn_frame_rate,
         "total_frames_in_file": total_frames,
+        "calibration_audit": calib_audit,
+        "frame_diagnostics": frame_diagnostics,
+        "baseline_diagnostics": baseline_diag,
+        "pipeline_config": config.__dict__,
+        "pixel_data": best_pixel_data,
     }
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _trim_frames(raw_dict: dict, threshold: float = 1.0) -> dict:
+def _trim_frames(raw_dict: dict, pressure_ceiling: float, threshold: float = 1.0) -> dict:
     """Jatin Files viewing logic:
-    1. Filter out corrupted frames (>2700 or hardware glitch where >2% sensels are >200 PSI).
+    1. Filter out corrupted frames (>2700 or hardware glitch where >2% sensels are > pressure_ceiling * 1.15).
     2. Require > 100 sensels with pressure > threshold.
     3. Compute load per valid frame and locate peak contact frame.
     4. Return a 50-frame playback window centered around the peak contact event.
@@ -301,7 +615,7 @@ def _trim_frames(raw_dict: dict, threshold: float = 1.0) -> dict:
 
     valid_fns = [
         fn for fn in frame_numbers[:max_valid_frame]
-        if np.mean(raw_dict[fn] > 500.0) < 0.02 and np.sum(raw_dict[fn] > threshold) >= CONTACT_AREA_MIN
+        if np.mean(raw_dict[fn] > pressure_ceiling * 1.15) < 0.02 and np.sum(raw_dict[fn] > threshold) >= CONTACT_AREA_MIN
     ]
     if not valid_fns:
         valid_fns = frame_numbers[:min(50, num_frames)]
@@ -309,7 +623,7 @@ def _trim_frames(raw_dict: dict, threshold: float = 1.0) -> dict:
 
     # Calculate load per frame to find peak contact frame
     valid_loads = [
-        float(np.sum(raw_dict[fn][(raw_dict[fn] > threshold) & (raw_dict[fn] < 600.0)]))
+        float(np.sum(raw_dict[fn][(raw_dict[fn] > threshold) & (raw_dict[fn] < pressure_ceiling * 1.15)]))
         for fn in valid_fns
     ]
     peak_sub_idx = int(np.argmax(valid_loads))
@@ -332,7 +646,17 @@ def _frame_metrics_13(
     sensel_h_mm: float,
     vmax_psi: float,
 ) -> dict:
-    """Compute all 13 standard tyre parameters for a frame using segmented contact patch."""
+    """Compute all standard tyre footprint parameters per Apollo Tyres reference spec.
+
+    Reference definitions:
+      FP Width W  — width at the centre of FP (centre row)
+      FP Length L — length at the centre of FP (centre column)
+      S1/S2       — shoulder lengths at 10% inset from tread edges
+      Squareness  — (S1/L)*100, (S2/L)*100
+      PA          — perimeter area (convex hull enclosing footprint)
+      CA          — contact area (active sensels only, excludes grooves)
+      Contact Ratio — (CA / PA) * 100
+    """
     mask = _segment_contact(arr, threshold)
     active = int(np.sum(mask))
 
@@ -340,7 +664,7 @@ def _frame_metrics_13(
     peak_psi = float(np.max(arr[mask])) if active > 0 else 0.0
     avg_psi  = float(np.mean(arr[mask])) if active > 0 else 0.0
 
-    contact_area_mm2 = active * sensel_area_mm2
+    contact_area_mm2 = active * sensel_area_mm2  # CA
     PSI_TO_N_PER_MM2 = 0.00689476
     total_load_n     = float(np.sum(arr[mask]) * PSI_TO_N_PER_MM2 * sensel_area_mm2)
     total_load_kg    = total_load_n / 9.80665
@@ -352,14 +676,16 @@ def _frame_metrics_13(
         return {
             "frame_number":         frame_number,
             "contact_area_mm2":     0.0,
+            "perimeter_area_mm2":   0.0,
             "contact_ratio_pct":    0.0,
             "fp_width_mm":          0.0,
             "fp_length_mm":         0.0,
             "outer_shoulder_s1_mm": 0.0,
             "inner_shoulder_s2_mm": 0.0,
             "shoulder_skewness_pct":0.0,
-            "squareness_s1_s2_pct": 100.0,
-            "squareness_avg":       0.0,
+            "squareness_s1_pct":    0.0,
+            "squareness_s2_pct":    0.0,
+            "squareness_avg_pct":   0.0,
             "land_sea_ratio":       0.0,
             "contact_pressure_psi": 0.0,
             "maximum_length_mm":    0.0,
@@ -378,31 +704,47 @@ def _frame_metrics_13(
 
     bbox_h_sensels = r_max - r_min + 1
     bbox_w_sensels = c_max - c_min + 1
-    bbox_area_sensels = bbox_h_sensels * bbox_w_sensels
 
-    fp_width_mm  = round(bbox_w_sensels * sensel_w_mm, 1)
-    fp_length_mm = round(bbox_h_sensels * sensel_h_mm, 1)
+    # ── FP Width W: width at the CENTRE row of the footprint ──────────
+    r_mid = (r_min + r_max) // 2
+    centre_row_mask = mask[r_mid, :]
+    if np.any(centre_row_mask):
+        cr_cmin = int(np.argmax(centre_row_mask))
+        cr_cmax = int(len(centre_row_mask) - 1 - np.argmax(centre_row_mask[::-1]))
+        fp_width_sensels = cr_cmax - cr_cmin + 1
+    else:
+        fp_width_sensels = bbox_w_sensels  # fallback to bbox
+    fp_width_mm = round(fp_width_sensels * sensel_w_mm, 1)
 
-    contact_ratio_pct = round((active / bbox_area_sensels) * 100.0, 1) if bbox_area_sensels > 0 else 0.0
+    # ── FP Length L: length at the CENTRE column of the footprint ─────
+    c_mid = (c_min + c_max) // 2
+    centre_col_mask = mask[:, c_mid]
+    if np.any(centre_col_mask):
+        cc_rmin = int(np.argmax(centre_col_mask))
+        cc_rmax = int(len(centre_col_mask) - 1 - np.argmax(centre_col_mask[::-1]))
+        fp_length_sensels = cc_rmax - cc_rmin + 1
+    else:
+        fp_length_sensels = bbox_h_sensels  # fallback to bbox
+    fp_length_mm = round(fp_length_sensels * sensel_h_mm, 1)
 
-    # Max length across columns
+    # ── Per-column contact lengths (for shoulder measurement) ─────────
+    col_lengths_sensels = []
     max_col_sensels = 0
-    col_lengths = []
     for c in range(c_min, c_max + 1):
         col_mask = mask[:, c]
         if np.any(col_mask):
             c_rmin = int(np.argmax(col_mask))
             c_rmax = int(len(col_mask) - 1 - np.argmax(col_mask[::-1]))
             c_len = c_rmax - c_rmin + 1
-            col_lengths.append(c_len)
+            col_lengths_sensels.append(c_len)
             if c_len > max_col_sensels:
                 max_col_sensels = c_len
         else:
-            col_lengths.append(0)
+            col_lengths_sensels.append(0)
 
     max_length_mm = round(max_col_sensels * sensel_h_mm, 1)
 
-    # Max width across rows
+    # ── Per-row contact widths (for max width) ────────────────────────
     max_row_sensels = 0
     for r in range(r_min, r_max + 1):
         row_mask = mask[r, :]
@@ -414,44 +756,78 @@ def _frame_metrics_13(
                 max_row_sensels = r_w
     max_width_mm = round(max_row_sensels * sensel_w_mm, 1)
 
-    # Outer Shoulder S1 vs Inner Shoulder S2 (outer 20% strips)
-    shoulder_w_sensels = max(2, int(round(0.20 * bbox_w_sensels)))
-    left_strip_lens  = col_lengths[:shoulder_w_sensels]
-    right_strip_lens = col_lengths[-shoulder_w_sensels:]
+    # ── Shoulder S1 / S2: measured at 10% inset from edges ────────────
+    # Reference: "10% inside from the edges of the tread towards the centre"
+    # S1 = contact length at the column 10% inside from the outer edge
+    # S2 = contact length at the column 10% inside from the inner edge
+    n_cols = len(col_lengths_sensels)
+    inset_10pct = max(1, int(round(0.10 * n_cols)))
 
-    left_s_mm  = float(np.mean(left_strip_lens)) * sensel_h_mm if left_strip_lens else 0.0
-    right_s_mm = float(np.mean(right_strip_lens)) * sensel_h_mm if right_strip_lens else 0.0
+    # Average a small neighbourhood around the 10% inset point for stability
+    def _shoulder_length_at_inset(col_lens, inset_idx):
+        """Get shoulder length at inset position, averaging ±1 column for stability."""
+        start = max(0, inset_idx - 1)
+        end = min(len(col_lens), inset_idx + 2)
+        vals = [col_lens[i] for i in range(start, end) if col_lens[i] > 0]
+        return float(np.mean(vals)) * sensel_h_mm if vals else 0.0
+
+    left_inset_idx = inset_10pct  # 10% from left edge
+    right_inset_idx = n_cols - 1 - inset_10pct  # 10% from right edge
+
+    left_s_mm = _shoulder_length_at_inset(col_lengths_sensels, left_inset_idx)
+    right_s_mm = _shoulder_length_at_inset(col_lengths_sensels, right_inset_idx)
 
     # FL & RL (Left of car): Outer = Left, Inner = Right
     # FR & RR (Right of car): Outer = Right, Inner = Left
     if position in ("FL", "RL"):
-        s1 = round(left_s_mm, 1)
-        s2 = round(right_s_mm, 1)
+        s1 = round(left_s_mm, 1)   # Outer shoulder
+        s2 = round(right_s_mm, 1)  # Inner shoulder
     else:
-        s1 = round(right_s_mm, 1)
-        s2 = round(left_s_mm, 1)
+        s1 = round(right_s_mm, 1)  # Outer shoulder
+        s2 = round(left_s_mm, 1)   # Inner shoulder
 
+    # ── Shoulder Skewness: ((S1 - S2) / Avg(S1, S2)) * 100 ──────────
     s_avg_val = (s1 + s2) / 2.0
     shoulder_skewness_pct = round(((s1 - s2) / s_avg_val) * 100.0, 1) if s_avg_val > 0 else 0.0
-    squareness_s1_s2_pct  = round((s1 / s2) * 100.0, 1) if s2 > 0 else 100.0
-    squareness_avg        = round(s_avg_val / fp_length_mm, 2) if fp_length_mm > 0 else 0.0
 
-    sea_sensels    = bbox_area_sensels - active
-    land_sea_ratio = round(active / sea_sensels, 2) if sea_sensels > 0 else 0.0
+    # ── Squareness: (S1/L)*100, (S2/L)*100, (Avg/L)*100 ─────────────
+    # Reference: L is the centre length (fp_length_mm)
+    squareness_s1_pct = round((s1 / fp_length_mm) * 100.0, 1) if fp_length_mm > 0 else 0.0
+    squareness_s2_pct = round((s2 / fp_length_mm) * 100.0, 1) if fp_length_mm > 0 else 0.0
+    squareness_avg_pct = round((s_avg_val / fp_length_mm) * 100.0, 1) if fp_length_mm > 0 else 0.0
+
+    # ── Perimeter Area (PA): convex hull enclosing the footprint ─────
+    # PA includes grooves and sipes within the tyre outline
+    active_coords = np.argwhere(mask)  # (N, 2) array of [row, col]
+    if len(active_coords) >= 3:
+        hull = cv2.convexHull(active_coords[:, ::-1].astype(np.float32))  # cv2 wants (x, y)
+        pa_sensels = float(cv2.contourArea(hull))
+        perimeter_area_mm2 = round(pa_sensels * sensel_area_mm2, 1)
+    else:
+        perimeter_area_mm2 = contact_area_mm2  # fallback
+
+    # ── Contact Ratio: (CA / PA) * 100 ───────────────────────────────
+    contact_ratio_pct = round((contact_area_mm2 / perimeter_area_mm2) * 100.0, 1) if perimeter_area_mm2 > 0 else 0.0
+
+    # ── Land/Sea Ratio: CA / (PA - CA) ───────────────────────────────
+    sea_mm2 = perimeter_area_mm2 - contact_area_mm2
+    land_sea_ratio = round(contact_area_mm2 / sea_mm2, 2) if sea_mm2 > 0 else 0.0
 
     total_sensels = arr.shape[0] * arr.shape[1]
 
     return {
         "frame_number":          frame_number,
         "contact_area_mm2":      round(contact_area_mm2, 1),
+        "perimeter_area_mm2":    perimeter_area_mm2,
         "contact_ratio_pct":     contact_ratio_pct,
         "fp_width_mm":           fp_width_mm,
         "fp_length_mm":          fp_length_mm,
         "outer_shoulder_s1_mm":  s1,
         "inner_shoulder_s2_mm":  s2,
         "shoulder_skewness_pct": shoulder_skewness_pct,
-        "squareness_s1_s2_pct":  squareness_s1_s2_pct,
-        "squareness_avg":        squareness_avg,
+        "squareness_s1_pct":     squareness_s1_pct,
+        "squareness_s2_pct":     squareness_s2_pct,
+        "squareness_avg_pct":    squareness_avg_pct,
         "land_sea_ratio":        land_sea_ratio,
         "contact_pressure_psi":  round(avg_psi, 2),
         "maximum_length_mm":     max_length_mm,
@@ -462,6 +838,7 @@ def _frame_metrics_13(
         "active_sensels":        active,
         "contact_pct":           round(100.0 * active / total_sensels, 2),
     }
+
 
 
 def _contact_patch_exact(

@@ -458,6 +458,19 @@ function showDashboard(data) {
 
   renderBestFrame();
 
+  // Initialize new diagnostic panels
+  initPixelInspector();
+  populateFrameDiagnostics();
+  populateCalibrationAudit();
+  
+  // CSV export button
+  const diagCsvBtn = $('diag-csv-btn');
+  if (diagCsvBtn) {
+    const newDiagBtn = diagCsvBtn.cloneNode(true);
+    diagCsvBtn.replaceWith(newDiagBtn);
+    newDiagBtn.addEventListener('click', exportDiagnosticsCSV);
+  }
+
   frameSlider.min   = 0;
   frameSlider.max   = frame_numbers.length - 1;
   frameSlider.value = data.best_frame_index;
@@ -583,8 +596,9 @@ function updateMetrics(m) {
   setEl('m-s1',       m.outer_shoulder_s1_mm);
   setEl('m-s2',       m.inner_shoulder_s2_mm);
   setEl('m-skew',     m.shoulder_skewness_pct);
-  setEl('m-sq-ratio', m.squareness_s1_s2_pct);
-  setEl('m-sq-avg',   m.squareness_avg);
+  setEl('m-sq-s1',  m.squareness_s1_pct);
+  setEl('m-sq-s2',  m.squareness_s2_pct);
+  setEl('m-sq-avg',  m.squareness_avg_pct);
   setEl('m-ls-ratio', m.land_sea_ratio);
   setEl('m-avg',      m.contact_pressure_psi || m.avg_pressure_psi);
   setEl('m-max-l',    m.maximum_length_mm);
@@ -699,6 +713,232 @@ function formatBytes(bytes) {
   if (bytes < 1024)    return bytes + ' B';
   if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+// ──────────────────────────────────────────────────────
+// PIXEL INSPECTOR
+// ──────────────────────────────────────────────────────
+
+function initPixelInspector() {
+  const bestCanvasWrap = $('best-canvas-wrap');
+  if (bestCanvasWrap) {
+    bestCanvasWrap.style.cursor = 'crosshair';
+    bestCanvasWrap.addEventListener('click', (e) => {
+      if (!state.data || !state.data.pixel_data) return;
+      const rect = bestCanvasWrap.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      const scaleX = state.gridW / rect.width;
+      const scaleY = state.gridH / rect.height;
+      // Canvas is flipped vertically in _serialise_frame, so row = gridH - 1 - canvasRow
+      const canvasCol = Math.floor(x * scaleX);
+      const canvasRow = Math.floor(y * scaleY);
+      const dataRow = state.gridH - 1 - canvasRow;  // undo flipud
+      const dataCol = canvasCol;
+      
+      $('inspect-row').value = dataRow;
+      $('inspect-col').value = dataCol;
+      if (state.data.best_frame_number !== undefined) {
+        $('inspect-frame').value = state.data.best_frame_number;
+      }
+      inspectPixel(dataRow, dataCol);
+    });
+  }
+  
+  const inspectBtn = $('inspect-btn');
+  if (inspectBtn) {
+    inspectBtn.addEventListener('click', () => {
+      const row = parseInt($('inspect-row').value, 10);
+      const col = parseInt($('inspect-col').value, 10);
+      if (!isNaN(row) && !isNaN(col)) {
+        inspectPixel(row, col);
+      }
+    });
+  }
+}
+
+function inspectPixel(row, col) {
+  if (!state.data || !state.data.pixel_data) {
+    $('inspector-status').textContent = 'No pixel data available';
+    return;
+  }
+  
+  const pd = state.data.pixel_data;
+  const rows = pd.grid_rows;
+  const cols = pd.grid_cols;
+  
+  if (row < 0 || row >= rows || col < 0 || col >= cols) {
+    $('inspector-status').textContent = `Out of bounds: R${row} C${col}`;
+    return;
+  }
+  
+  const idx = row * cols + col;
+  
+  // Extract values from pixel_data arrays
+  const rawVal = pd.best_frame_raw ? pd.best_frame_raw[idx] : '—';
+  const calPsi = pd.best_frame_calibrated ? pd.best_frame_calibrated[idx] : '—';
+  const filteredPsi = pd.best_frame_filtered ? pd.best_frame_filtered[idx] : '—';
+  const finalPsi = pd.best_frame_final ? pd.best_frame_final[idx] : '—';
+  const isInvalid = pd.invalid_mask ? pd.invalid_mask[idx] : false;
+  const isSaturated = pd.saturation_mask ? pd.saturation_mask[idx] : false;
+  const isSpike = pd.spike_mask ? pd.spike_mask[idx] : false;
+  const isContact = pd.contact_mask ? pd.contact_mask[idx] : false;
+  
+  $('inspector-status').textContent = `R${row} C${col} — Frame ${state.data.best_frame_number}`;
+  
+  // Update display
+  $('px-raw').textContent = rawVal;
+  $('px-dtype').textContent = 'uint16';
+  $('px-invalid').textContent = isInvalid ? '⚠ YES' : 'No';
+  $('px-invalid').style.color = isInvalid ? '#ef4444' : '';
+  $('px-saturated').textContent = isSaturated ? '⚠ SATURATED' : 'No';
+  $('px-saturated').style.color = isSaturated ? '#ef4444' : '';
+  
+  $('px-cal-method').textContent = pd.calibration_method || '—';
+  $('px-cal-range').textContent = `${pd.pressure_range || '—'} (0–${pd.pressure_ceiling || '—'} PSI)`;
+  $('px-cal-psi').textContent = typeof calPsi === 'number' ? calPsi.toFixed(2) + ' PSI' : '—';
+  $('px-confidence').textContent = pd.calibration_confidence || '—';
+  
+  $('px-temporal').textContent = 'N/A (best frame)';
+  $('px-spatial').textContent = isSpike ? '⚠ Spike detected → replaced' : 'No';
+  $('px-spatial').style.color = isSpike ? '#f59e0b' : '';
+  $('px-fft').textContent = typeof filteredPsi === 'number' ? filteredPsi.toFixed(2) + ' PSI' : '—';
+  $('px-patch').textContent = isContact ? 'Preserved (contact)' : 'Removed (no contact)';
+  
+  $('px-final').textContent = typeof finalPsi === 'number' ? finalPsi.toFixed(2) + ' PSI' : '—';
+  $('px-contact').textContent = isContact ? '✓ Contact' : '✗ No contact';
+  $('px-contact').style.color = isContact ? '#10b981' : '#ef4444';
+  
+  // 3x3 neighbourhood
+  const nbData = pd.best_frame_final || pd.best_frame_filtered || pd.best_frame_calibrated;
+  if (nbData) {
+    for (let dr = -1; dr <= 1; dr++) {
+      for (let dc = -1; dc <= 1; dc++) {
+        const nr = row + dr;
+        const nc = col + dc;
+        const cellId = `nb-${dr+1}${dc+1}`;
+        const cell = $(cellId);
+        if (cell) {
+          if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) {
+            const nIdx = nr * cols + nc;
+            const val = nbData[nIdx];
+            cell.textContent = typeof val === 'number' ? val.toFixed(1) : '—';
+          } else {
+            cell.textContent = '—';
+          }
+        }
+      }
+    }
+    // Row/col headers
+    $('nb-r0').textContent = `R${row-1}`;
+    $('nb-r1').textContent = `R${row}`;
+    $('nb-r2').textContent = `R${row+1}`;
+    $('nb-c0').textContent = `C${col-1}`;
+    $('nb-c1').textContent = `C${col}`;
+    $('nb-c2').textContent = `C${col+1}`;
+  }
+  
+  // Show the result panel
+  $('inspector-result').classList.remove('hidden');
+}
+
+// ──────────────────────────────────────────────────────
+// FRAME DIAGNOSTICS
+// ──────────────────────────────────────────────────────
+
+function populateFrameDiagnostics() {
+  const diag = state.data?.frame_diagnostics;
+  const tbody = $('diag-tbody');
+  if (!tbody || !diag || !diag.length) return;
+  
+  tbody.innerHTML = '';
+  for (const d of diag) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${d.frame_index ?? '—'}</td>
+      <td>${d.raw_min != null ? d.raw_min.toFixed(0) : '—'}</td>
+      <td>${d.raw_max != null ? d.raw_max.toFixed(0) : '—'}</td>
+      <td>${d.calibrated_min != null ? d.calibrated_min.toFixed(1) : '—'}</td>
+      <td>${d.calibrated_max != null ? d.calibrated_max.toFixed(1) : '—'}</td>
+      <td>${d.calibrated_mean != null ? d.calibrated_mean.toFixed(1) : '—'}</td>
+      <td>${d.calibrated_p95 != null ? d.calibrated_p95.toFixed(1) : '—'}</td>
+      <td>${d.active_sensels ?? '—'}</td>
+      <td>${d.contact_area_mm2 != null ? d.contact_area_mm2.toFixed(0) : '—'}</td>
+      <td>${d.invalid_count ?? '—'}</td>
+      <td>${d.saturation_count ?? '—'}</td>
+      <td>${d.spatial_spike_count ?? '—'}</td>
+      <td>${d.temporal_spike_count ?? '—'}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function exportDiagnosticsCSV() {
+  if (!state.data || !state.jobId) return;
+  
+  const diag = state.data.frame_diagnostics;
+  if (!diag || !diag.length) {
+    alert('No diagnostics data available.');
+    return;
+  }
+  
+  // Build CSV locally from the data we already have
+  const headers = ['Frame', 'Raw Min', 'Raw Max', 'Cal. Min', 'Cal. Max', 'Cal. Mean', 'Cal. P95', 'Cal. P98', 'Active Sensels', 'Area mm2', 'Load N', 'Invalid', 'Saturated', 'Spatial Spikes', 'Temporal Spikes'];
+  let csv = headers.join(',') + '\n';
+  for (const d of diag) {
+    csv += [
+      d.frame_index, d.raw_min?.toFixed(0), d.raw_max?.toFixed(0),
+      d.calibrated_min?.toFixed(2), d.calibrated_max?.toFixed(2), d.calibrated_mean?.toFixed(2),
+      d.calibrated_p95?.toFixed(2), d.calibrated_p98?.toFixed(2),
+      d.active_sensels, d.contact_area_mm2?.toFixed(1), d.total_load_n?.toFixed(1),
+      d.invalid_count, d.saturation_count, d.spatial_spike_count, d.temporal_spike_count
+    ].join(',') + '\n';
+  }
+  
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `frame_diagnostics_${state.data.source_file || 'export'}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ──────────────────────────────────────────────────────
+// CALIBRATION AUDIT
+// ──────────────────────────────────────────────────────
+
+function populateCalibrationAudit() {
+  const audit = state.data?.calibration_audit;
+  if (!audit) return;
+  
+  const setAudit = (id, val) => {
+    const el = $(id);
+    if (el) el.textContent = val ?? '—';
+  };
+  
+  setAudit('audit-sensor', audit.sensor);
+  setAudit('audit-vehicle', audit.vehicle_type);
+  setAudit('audit-range', audit.pressure_range);
+  setAudit('audit-source', audit.calibration_source);
+  setAudit('audit-method', audit.calibration_method);
+  setAudit('audit-raw-domain', audit.raw_domain);
+  setAudit('audit-psi-domain', audit.psi_domain);
+  setAudit('audit-scale', audit.scale);
+  setAudit('audit-offset', audit.offset);
+  setAudit('audit-saturated', audit.saturated_values);
+  setAudit('audit-invalid', audit.invalid_values);
+  setAudit('audit-spikes', audit.repaired_spikes);
+  setAudit('audit-baseline', audit.baseline_frame != null ? `Frame ${audit.baseline_frame}` : 'None');
+  setAudit('audit-conf-val', audit.calibration_confidence);
+  
+  const confBadge = $('audit-confidence');
+  if (confBadge) {
+    confBadge.textContent = audit.calibration_confidence || '—';
+    confBadge.setAttribute('data-level', audit.calibration_confidence || '');
+  }
 }
 
 // ── Initialise ────────────────────────────────────────

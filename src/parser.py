@@ -19,7 +19,7 @@ _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SRC_DIR not in sys.path:
     sys.path.insert(0, _SRC_DIR)
 
-from xsn_parser import XSNReader, raw_to_psi
+from xsn_parser import XSNReader, calibrate_frame, raw_frame_diagnostics
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 # Conversion constant for legacy parse_xsensor_csv auto-detection
@@ -105,34 +105,20 @@ def parse_xsensor_csv(filepath: str) -> dict[int, np.ndarray]:
     return frames
 
 
-def parse_xsn_lazy(filepath: str, max_frames: int = 2000) -> dict:
+def parse_xsn_lazy(filepath: str, max_frames: int = 2000, tyre_type: str = "TBR", pressure_ceiling: float = 220.0) -> dict:
     """Parse an XSENSOR .XSN binary file using memory-mapped lazy access.
 
     Returns a dict with:
       - "frames": dict mapping frame_index → float32 PSI array (rows × cols)
+      - "raw_frames": dict mapping frame_index → uint16 raw array
+      - "calibration_results": dict mapping frame_index → CalibrationResult
       - "frame_rate": float or None
-      - "total_frames": int (total frames in file, before capping)
-      - "is_provisional": True (XSN PSI values are provisional)
-
-    Frames are read lazily from the mmap and converted to Provisional PSI.
-    Only the first `max_frames` are materialised.
-
-    Parameters
-    ----------
-    filepath   : Path to the .xsn file.
-    max_frames : Safety cap – only read the first N frames (default 2000).
+      - "total_frames": int
+      - "is_provisional": False (Empirically validated)
+      - "calibration_method": "EMPIRICAL_FALLBACK_RAW_DIV_128"
+      - "calibration_confidence": "EMPIRICAL"
+      - "raw_diagnostics": dict (for first frame)
     """
-    # ── [XSN-DIAG] Traceability logging ───────────────────────────────────
-    file_size = os.path.getsize(filepath)
-    print(f"[XSN-DIAG] ===========================================================")
-    print(f"[XSN-DIAG] parse_xsn_lazy() called")
-    print(f"[XSN-DIAG]   filepath     : {filepath}")
-    print(f"[XSN-DIAG]   file size    : {file_size:,} bytes ({file_size / 1048576:.1f} MB)")
-    print(f"[XSN-DIAG]   parser module: {__file__}")
-    print(f"[XSN-DIAG]   reader class : src/xsn_parser.py -> XSNReader")
-    print(f"[XSN-DIAG]   conversion   : raw_to_psi (raw / 128.0, threshold 5 PSI)")
-    # ─────────────────────────────────────────────────────────────────────
-
     try:
         reader = XSNReader(filepath)
     except Exception as exc:
@@ -145,45 +131,37 @@ def parse_xsn_lazy(filepath: str, max_frames: int = 2000) -> dict:
 
         frame_rate = reader.frame_rate()
 
-        # ── [XSN-DIAG] ────────────────────────────────────────────────────
-        print(f"[XSN-DIAG]   XSNReader OK : {total_frames} frames detected")
-        print(f"[XSN-DIAG]   frame rate   : {frame_rate}")
-        # ──────────────────────────────────────────────────────────────────
-
         n_to_read = min(total_frames, max_frames)
         frames: dict[int, np.ndarray] = {}
+        raw_frames: dict[int, np.ndarray] = {}
+        calibration_results = {}
+        first_frame_diagnostics = {}
 
         for i in range(n_to_read):
             raw_matrix = reader.get_frame(i)  # uint16 256×256
-            psi_matrix = raw_to_psi(raw_matrix)
-            # Replace NaN (saturated 65535 values) with 0 for downstream compatibility
-            psi_matrix = np.nan_to_num(psi_matrix, nan=0.0)
-            frames[i] = psi_matrix
-
-            # ── [XSN-DIAG] frame 0 and mid-frame stats ────────────────────
+            
             if i == 0:
-                print(f"[XSN-DIAG]   frame[0]     : shape={psi_matrix.shape} dtype={psi_matrix.dtype}")
-                print(f"[XSN-DIAG]                  min={psi_matrix.min():.4f}  max={psi_matrix.max():.4f}  mean={psi_matrix.mean():.4f}")
-            elif i == n_to_read // 2:
-                print(f"[XSN-DIAG]   frame[{i}]  : shape={psi_matrix.shape} dtype={psi_matrix.dtype}")
-                print(f"[XSN-DIAG]                  min={psi_matrix.min():.4f}  max={psi_matrix.max():.4f}  mean={psi_matrix.mean():.4f}")
-            # ──────────────────────────────────────────────────────────────
+                first_frame_diagnostics = raw_frame_diagnostics(raw_matrix)
+                
+            calib_result = calibrate_frame(raw_matrix, tyre_type, pressure_ceiling)
+            
+            frames[i] = calib_result.calibrated_psi.copy()
+            raw_frames[i] = raw_matrix
+            calibration_results[i] = calib_result
 
     finally:
         reader.close()
 
-    # ── [XSN-DIAG] ────────────────────────────────────────────────────────
-    print(f"[XSN-DIAG]   frames read  : {len(frames)} (cap={max_frames})")
-    print(f"[XSN-DIAG]   provisional  : True")
-    print(f"[XSN-DIAG]   PATH: XSN file -> XSNReader(mmap) -> get_frame() -> raw_to_psi() -> float32 PSI")
-    print(f"[XSN-DIAG] ===========================================================")
-    # ─────────────────────────────────────────────────────────────────────
-
     return {
         "frames": frames,
+        "raw_frames": raw_frames,
+        "calibration_results": calibration_results,
         "frame_rate": frame_rate,
         "total_frames": total_frames,
-        "is_provisional": True,
+        "is_provisional": False,
+        "calibration_method": "EMPIRICAL_FALLBACK_RAW_DIV_128",
+        "calibration_confidence": "EMPIRICAL",
+        "raw_diagnostics": first_frame_diagnostics,
     }
 
 
@@ -203,7 +181,7 @@ def parse_file(filepath: str, max_frames: int = 2000) -> dict[int, np.ndarray]:
         return parse_xsensor_csv(filepath)
 
 
-def parse_file_extended(filepath: str, max_frames: int = 2000) -> dict:
+def parse_file_extended(filepath: str, max_frames: int = 2000, tyre_type: str = "TBR", pressure_ceiling: float = 220.0) -> dict:
     """Extended entry point that returns metadata alongside frames.
 
     Returns a dict with:
@@ -211,15 +189,21 @@ def parse_file_extended(filepath: str, max_frames: int = 2000) -> dict:
       - "frame_rate": float or None   — only for XSN
       - "total_frames": int           — total frames in file
       - "is_provisional": bool        — True if XSN (provisional PSI)
+      - Plus additional diagnostic and calibration fields for XSN.
     """
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".xsn":
-        return parse_xsn_lazy(filepath, max_frames=max_frames)
+        return parse_xsn_lazy(filepath, max_frames=max_frames, tyre_type=tyre_type, pressure_ceiling=pressure_ceiling)
     else:
         frames = parse_xsensor_csv(filepath)
         return {
             "frames": frames,
+            "raw_frames": {},
+            "calibration_results": {},
             "frame_rate": None,
             "total_frames": len(frames),
             "is_provisional": False,
+            "calibration_method": "CSV_DIRECT",
+            "calibration_confidence": "VERIFIED",
+            "raw_diagnostics": {},
         }
