@@ -33,9 +33,9 @@ def _flat_array_to_png(flat_uint8: list) -> bytes:
     """Convert flat 256x256 uint8 array to Jet colormap PNG bytes."""
     arr = np.array(flat_uint8, dtype=np.uint8).reshape((256, 256))
     rgb = JET_LUT[arr]
-    # For zero pressure sensels, set dark cyan background matching Img 1
+    # For zero pressure sensels, set pure white background
     zero_mask = (arr == 0)
-    rgb[zero_mask] = [220, 248, 252]  # Light cyan background as in Img 1
+    rgb[zero_mask] = [255, 255, 255]  # Pure white background
     pil_img = PILImage.fromarray(rgb, mode="RGB")
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
@@ -43,11 +43,11 @@ def _flat_array_to_png(flat_uint8: list) -> bytes:
 
 
 def _create_placeholder_png(label: str) -> bytes:
-    """Create a clean light cyan placeholder PNG for non-uploaded slots."""
-    pil_img = PILImage.new("RGB", (256, 256), color=(230, 250, 252))
+    """Create a clean white placeholder PNG for non-uploaded slots."""
+    pil_img = PILImage.new("RGB", (256, 256), color=(255, 255, 255))
     draw = ImageDraw.Draw(pil_img)
     # Draw simple frame
-    draw.rectangle([10, 10, 245, 245], outline=(180, 220, 230), width=2)
+    draw.rectangle([10, 10, 245, 245], outline=(220, 220, 220), width=2)
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
     return buf.getvalue()

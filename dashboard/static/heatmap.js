@@ -46,10 +46,10 @@ function drawHeatmap(canvas, data, W = 256, H = 256) {
     const li = v * 3;
     const pi = i * 4;
     if (v === 0) {
-      // True zero → near-black background (no contact)
-      px[pi]     = 10;
-      px[pi + 1] = 12;
-      px[pi + 2] = 16;
+      // True zero → white background (no contact)
+      px[pi]     = 255;
+      px[pi + 1] = 255;
+      px[pi + 2] = 255;
     } else {
       px[pi]     = JET[li];
       px[pi + 1] = JET[li + 1];
@@ -63,7 +63,7 @@ function drawHeatmap(canvas, data, W = 256, H = 256) {
 
 /**
  * Draw the EXACT tyre outline on the overlay canvas using per-row edge points.
- * Renders a thin white stroke polygon that matches the real tyre contact boundary,
+ * Renders a thin dark stroke polygon that matches the real tyre contact boundary,
  * NOT a rectangular bounding box.
  *
  * @param {HTMLCanvasElement} overlayCanvas
@@ -96,10 +96,10 @@ function drawTyreOutline(overlayCanvas, outlinePoints, gridW = 256, gridH = 256)
     }
     ctx.closePath();
 
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.03)';
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.02)';
     ctx.fill();
 
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+    ctx.strokeStyle = 'rgba(30, 30, 30, 0.85)';
     ctx.lineWidth   = 1.2;
     ctx.setLineDash([]);
     ctx.stroke();
@@ -108,7 +108,7 @@ function drawTyreOutline(overlayCanvas, outlinePoints, gridW = 256, gridH = 256)
 
 /**
  * Draw a simple bounding-box outline (fallback if no outline_points available).
- * Uses the same white style as drawTyreOutline for consistency.
+ * Uses the same dark style as drawTyreOutline for consistency.
  * @param {HTMLCanvasElement} overlayCanvas
  * @param {number[]} bbox  – [x0, y0, x1, y1] in sensel coords (origin=lower)
  * @param {number} gridW
@@ -131,7 +131,7 @@ function drawBbox(overlayCanvas, bbox, gridW = 256, gridH = 256) {
   const rw = (x1 - x0 + 1) * scaleX;
   const rh = (y1 - y0 + 1) * scaleY;
 
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)';
+  ctx.strokeStyle = 'rgba(30, 30, 30, 0.75)';
   ctx.lineWidth   = 1.5;
   ctx.setLineDash([5, 3]);
   ctx.strokeRect(rx, ry, rw, rh);

@@ -30,9 +30,20 @@ from processor import load_and_process
 from pdf_export import generate_report_pdf
 
 # ── App setup ─────────────────────────────────────────────────────────────────
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR  = os.path.join(BASE_DIR, "static")
-UPLOAD_DIR  = os.path.join(BASE_DIR, "uploads")
+if getattr(sys, "frozen", False):
+    BASE_DIR = sys._MEIPASS
+    APP_DIR  = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    APP_DIR  = BASE_DIR
+
+# Include src directory in sys.path if present
+src_path = os.path.join(BASE_DIR, "src")
+if os.path.exists(src_path) and src_path not in sys.path:
+    sys.path.insert(0, src_path)
+
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+UPLOAD_DIR = os.path.join(APP_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="/static")
@@ -342,8 +353,16 @@ def _run_processing(
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("-" * 60)
-    print("  Apollo Tyre Pressure Dashboard")
-    print("  http://localhost:5050")
-    print("-" * 60)
-    app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)
+    import webbrowser
+
+    port = 5050
+    url = f"http://127.0.0.1:{port}"
+
+    print("=" * 60)
+    print("  Apollo Tyre Pressure Analysis Application")
+    print(f"  Launching web interface at: {url}")
+    print("=" * 60)
+
+    # Open browser after a brief delay
+    threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
