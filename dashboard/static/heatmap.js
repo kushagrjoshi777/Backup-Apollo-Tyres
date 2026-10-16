@@ -105,19 +105,19 @@ function drawTyreOutline(overlayCanvas, contours, gridW = 256, gridH = 256) {
   for (const flat of contours) {
     if (!flat || flat.length < 6) continue;
     trace(flat);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';   // thin halo keeps the edge readable on dark blue
-    ctx.lineWidth   = 3.4 * dpr;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.9)';   // thin halo keeps the pink edge readable on all colours
+    ctx.lineWidth   = 3.8 * dpr;
     ctx.stroke();
     trace(flat);
-    ctx.strokeStyle = 'rgba(10, 10, 10, 1)';
-    ctx.lineWidth   = 1.6 * dpr;
+    ctx.strokeStyle = '#E91E63';                    // Pink footprint boundary line
+    ctx.lineWidth   = 2.2 * dpr;
     ctx.stroke();
   }
 }
 
 /**
  * Draw a simple bounding-box outline (fallback if no outline_points available).
- * Uses the same dark style as drawTyreOutline for consistency.
+ * Uses the same pink style as drawTyreOutline for consistency.
  * @param {HTMLCanvasElement} overlayCanvas
  * @param {number[]} bbox  – [x0, y0, x1, y1] in sensel coords (origin=lower)
  * @param {number} gridW
@@ -140,8 +140,8 @@ function drawBbox(overlayCanvas, bbox, gridW = 256, gridH = 256) {
   const rw = (x1 - x0 + 1) * scaleX;
   const rh = (y1 - y0 + 1) * scaleY;
 
-  ctx.strokeStyle = 'rgba(30, 30, 30, 0.75)';
-  ctx.lineWidth   = 1.5;
+  ctx.strokeStyle = '#E91E63';
+  ctx.lineWidth   = 2.0;
   ctx.setLineDash([5, 3]);
   ctx.strokeRect(rx, ry, rw, rh);
   ctx.setLineDash([]);

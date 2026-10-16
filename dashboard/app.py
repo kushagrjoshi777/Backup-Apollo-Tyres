@@ -83,13 +83,14 @@ def upload():
     if not _allowed(f.filename):
         return jsonify({"error": "Only .csv and .xsn files are accepted"}), 400
 
-    tyre_type = request.form.get("tyre_type", "TBR")
+    tyre_type = request.form.get("tyre_type", "TBR").upper()
+    default_min = 18.0 if tyre_type == "TBR" else 5.0
     try:
-        min_pressure = float(request.form.get("min_pressure", 5.0))
-        max_pressure = float(request.form.get("max_pressure", 220.0))
+        min_pressure = float(request.form.get("min_pressure", default_min))
+        max_pressure = float(request.form.get("max_pressure", 220.0 if tyre_type == "TBR" else 100.0))
     except ValueError:
-        min_pressure = 5.0
-        max_pressure = 220.0
+        min_pressure = default_min
+        max_pressure = 220.0 if tyre_type == "TBR" else 100.0
 
     try:
         speed = float(request.form.get("speed", 0.0))

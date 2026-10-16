@@ -32,7 +32,7 @@ FILTER_TYPES = (
 class PipelineConfig:
     tyre_type: str = "TBR"
     pressure_ceiling: float = 220.0
-    min_pressure: float = 5.0            # noise floor (PSI)
+    min_pressure: float = 18.0           # contact threshold (18.0 PSI for TBR, 5.0 PSI for PCR)
     # ── main noise-removal engine ──
     filter_type: str = "fft_butterworth_lp"
     fft_enabled: bool = True             # legacy flag (derived from filter_type)
@@ -50,9 +50,9 @@ class PipelineConfig:
     spatial_mad_threshold: float = 4.0
     # ── clean-up stages ──
     patch_filter_enabled: bool = True
-    sensel_area_mm2: float = 2.434
+    sensel_area_mm2: float = 2.4336      # 1.56 mm × 1.56 mm
     min_patch_area_mm2: float = 12.0
-    patch_preserve_threshold_psi: float = 20.0
+    patch_preserve_threshold_psi: float = 25.0
     morph_open: int = 0                  # binary opening kernel (0 = off)
     morph_close: int = 0                 # grey closing kernel (0 = off)
     keep_largest_only: bool = False
@@ -123,25 +123,32 @@ def config_with_overrides(base: "PipelineConfig", overrides: dict | None) -> "Pi
 # Allow importing from parent src/ directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.parser import parse_file_extended
+from src.xsn_parser import XSNReader
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-PRESSURE_THRESHOLD   = 5.0    # PSI — below this is considered noise / no-contact
-CONTACT_AREA_MIN     = 100    # minimum active sensels to count as a "meaningful" frame
-DEFAULT_SENSEL_MM    = 1.6    # mm pitch per sensel (0.16 cm XSENSOR standard)
-XSN_SENSEL_MM        = 1.6    # mm pitch for XSENSOR HX510 sensor mat (0.16 cm = 1.6 mm)
+PRESSURE_THRESHOLD_TBR = 18.0  # PSI — TBR contact threshold per XSENSOR / Apollo spec
+PRESSURE_THRESHOLD_PCR = 5.0   # PSI — PCR contact threshold
+PRESSURE_THRESHOLD     = 18.0  # Default TBR threshold
+CONTACT_AREA_MIN       = 100   # minimum active sensels to count as a "meaningful" frame
+DEFAULT_SENSEL_MM      = 1.56  # mm pitch per sensel (40 cm / 256 sensels = 1.5625 mm ≈ 1.56 mm)
+XSN_SENSEL_MM          = 1.56  # mm pitch for XSENSOR HX510 sensor mat (verified from XSN header)
 
 # Tyre type → pressure ceiling (PSI)
 VMAX_BY_TYPE = {"PCR": 100, "TBR": 220}
 DEFAULT_VMAX = 150
 
 # Max frames to process from large files (perf guard)
-MAX_XSN_FRAMES = 2000
+MAX_XSN_FRAMES = 3000
+
+
+def default_min_pressure(tyre_type: str = "TBR") -> float:
+    return PRESSURE_THRESHOLD_TBR if str(tyre_type).upper() == "TBR" else PRESSURE_THRESHOLD_PCR
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def extract_metadata_from_file(filepath: str) -> dict:
-    """Extract auto-detected speed, tyre position, and sensel pitch from filename / CSV header."""
+    """Extract auto-detected speed, tyre position, and sensel pitch from XSN binary header or CSV header."""
     filename = os.path.basename(filepath)
     ext = os.path.splitext(filename)[1].lower()
     speed = 0.0
@@ -164,9 +171,19 @@ def extract_metadata_from_file(filepath: str) -> dict:
     is_xsn = ext == ".xsn"
     sensel_width_mm  = XSN_SENSEL_MM if is_xsn else DEFAULT_SENSEL_MM
     sensel_height_mm = XSN_SENSEL_MM if is_xsn else DEFAULT_SENSEL_MM
+    pitch_source = "default"
 
-    # For CSV files: search header for explicit sensel pitch
-    if not is_xsn:
+    if is_xsn:
+        try:
+            with XSNReader(filepath) as reader:
+                pitch = reader.sensel_pitch_mm()
+                if pitch is not None:
+                    sensel_width_mm, sensel_height_mm = pitch
+                    pitch_source = "xsn_header"
+        except Exception:
+            pass
+    else:
+        # For CSV files: search header for explicit sensel pitch
         try:
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 for _ in range(50):
@@ -184,11 +201,13 @@ def extract_metadata_from_file(filepath: str) -> dict:
                     if "Sensel Width (cm)" in line:
                         try:
                             sensel_width_mm = float(line.split(",")[1].strip()) * 10.0
+                            pitch_source = "csv_header"
                         except (IndexError, ValueError):
                             pass
                     if "Sensel Height (cm)" in line:
                         try:
                             sensel_height_mm = float(line.split(",")[1].strip()) * 10.0
+                            pitch_source = "csv_header"
                         except (IndexError, ValueError):
                             pass
         except Exception:
@@ -199,9 +218,9 @@ def extract_metadata_from_file(filepath: str) -> dict:
         "position": position,
         "sensel_width_mm": sensel_width_mm,
         "sensel_height_mm": sensel_height_mm,
+        "pitch_source": pitch_source,
         "is_xsn": is_xsn,
     }
-
 
 
 def _radial_freq(shape: tuple) -> np.ndarray:
@@ -236,54 +255,86 @@ def _fourier_transfer(shape: tuple, spectrum_mag: np.ndarray | None, config: Pip
 def apply_noise_filter(
     frame_psi: np.ndarray,
     config: PipelineConfig,
+    support_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int, float]:
     """
     Main noise-removal engine. Supports spatial (Gaussian / median / bilateral) and
     Fourier-domain (Butterworth / Gaussian / ideal low-pass, spectral notch) filters.
+
+    CRITICAL: Filtering smooths pressure noise WITHOUT stretching or reshaping the
+    footprint. When ``support_mask`` (the un-blurred contact mask) is supplied or derived
+    from the pre-smoothed frame, normalized convolution / boundary clamping keeps real
+    footprint edges and tread grooves intact so smoothing never bleeds pressure outward
+    into non-contact sensels or erodes contact sensels below ``min_pressure``.
+
     Returns (filtered, removed_noise, n_spikes_repaired, energy_removed).
     """
     kind = config.filter_type
     src = frame_psi.astype(np.float32)
     n_spikes = 0
 
+    if support_mask is None:
+        support_mask = src >= config.min_pressure
+    else:
+        support_mask = np.asarray(support_mask, dtype=bool)
+
     if kind == "none":
-        filtered = src.copy()
+        filtered = np.where(support_mask, src, 0.0).astype(np.float32)
     elif kind in ("gaussian", "median", "bilateral"):
         if kind == "gaussian":
-            filtered = cv2.GaussianBlur(src, (0, 0), float(config.gaussian_sigma))
+            sigma = float(config.gaussian_sigma)
+            # Normalized convolution inside the contact support mask prevents edge bleed/shrinkage
+            masked_src = np.where(support_mask, src, 0.0).astype(np.float32)
+            weight = support_mask.astype(np.float32)
+            num = cv2.GaussianBlur(masked_src, (0, 0), sigma)
+            den = cv2.GaussianBlur(weight, (0, 0), sigma)
+            filtered = np.where(support_mask & (den > 1e-5), num / np.maximum(den, 1e-5), 0.0).astype(np.float32)
         elif kind == "median":
-            filtered = median_filter(src, size=int(config.median_size))
+            med = median_filter(src, size=int(config.median_size)).astype(np.float32)
+            # Keep original value if median across groove/edge would drop an active sensel below threshold
+            filtered = np.where(
+                support_mask,
+                np.where(med >= config.min_pressure, med, src),
+                0.0,
+            ).astype(np.float32)
         else:
-            filtered = cv2.bilateralFilter(
+            bil = cv2.bilateralFilter(
                 src, d=0,
                 sigmaColor=float(config.bilateral_sigma_color),
                 sigmaSpace=float(config.bilateral_sigma_space),
-            )
-        src = src
+            ).astype(np.float32)
+            filtered = np.where(
+                support_mask,
+                np.where(bil >= config.min_pressure, bil, src),
+                0.0,
+            ).astype(np.float32)
     else:
         # Fourier path — first repair hard single-sensel spikes so they do not ring.
         med = median_filter(src, size=3)
         diff = np.abs(src - med)
-        spike_mask = (diff > (20.0 + 0.3 * med)) & (src > config.min_pressure)
+        spike_mask = (diff > (20.0 + 0.3 * med)) & support_mask
         n_spikes = int(np.sum(spike_mask))
-        src = src.copy()
-        src[spike_mask] = med[spike_mask]
+        work_src = src.copy()
+        work_src[spike_mask] = np.maximum(med[spike_mask], config.min_pressure)
 
-        pad = int(max(0, min(16, min(src.shape) - 1)))
-        padded = np.pad(src.astype(np.float64), pad, mode="reflect") if pad else src.astype(np.float64)
+        pad = int(max(0, min(16, min(work_src.shape) - 1)))
+        padded = np.pad(work_src.astype(np.float64), pad, mode="reflect") if pad else work_src.astype(np.float64)
         spectrum = fft2(padded)
         h = _fourier_transfer(padded.shape, np.abs(spectrum), config)
         out = np.real(ifft2(spectrum * h))
         if pad:
             out = out[pad:-pad, pad:-pad]
-        filtered = out.astype(np.float32)
+        out_f32 = out.astype(np.float32)
+        # Confine smoothed pressures strictly to the true footprint support mask
+        filtered = np.where(
+            support_mask,
+            np.maximum(out_f32, config.min_pressure),
+            0.0,
+        ).astype(np.float32)
 
-    filtered = np.clip(filtered, 0.0, None)
-    filtered[filtered < config.min_pressure] = 0.0
-
-    noise = src - filtered
+    noise = np.where(support_mask, src - filtered, 0.0).astype(np.float32)
     energy_removed = float(np.sum(np.abs(noise)))
-    return filtered.astype(np.float32), noise.astype(np.float32), n_spikes, energy_removed
+    return filtered, noise, n_spikes, energy_removed
 
 
 def apply_fft_butterworth(frame_psi, config):
@@ -514,7 +565,7 @@ def _xsn_temporal_average(
 def prepare_job(
     filepath: str,
     tyre_type: str = "TBR",
-    min_pressure: float = 5.0,
+    min_pressure: float | None = None,
     max_pressure: float = 220.0,
     speed: float = 0.0,
     position: str = "FR",
@@ -523,6 +574,10 @@ def prepare_job(
     Parse + calibrate + baseline-subtract + trim once. The returned context is cached so
     the (cheap) filter pipeline can be re-run live with different noise settings.
     """
+    tyre_type = (tyre_type or "TBR").upper()
+    if min_pressure is None or (tyre_type == "TBR" and abs(min_pressure - 5.0) < 1e-3):
+        min_pressure = default_min_pressure(tyre_type)
+
     meta = extract_metadata_from_file(filepath)
     if speed == 0.0 and meta["speed"] > 0:
         speed = meta["speed"]
@@ -535,7 +590,7 @@ def prepare_job(
     is_xsn = meta["is_xsn"]
 
     base_config = PipelineConfig(
-        tyre_type=tyre_type.upper(),
+        tyre_type=tyre_type,
         pressure_ceiling=max_pressure,
         min_pressure=min_pressure,
         sensel_area_mm2=sensel_w * sensel_h,
@@ -545,6 +600,12 @@ def prepare_job(
         filepath, max_frames=MAX_XSN_FRAMES,
         tyre_type=base_config.tyre_type, pressure_ceiling=base_config.pressure_ceiling,
     )
+    if parsed.get("sensel_width_mm"):
+        sensel_w = float(parsed["sensel_width_mm"])
+    if parsed.get("sensel_height_mm"):
+        sensel_h = float(parsed["sensel_height_mm"])
+    base_config.sensel_area_mm2 = sensel_w * sensel_h
+
     calibrated_frames = parsed["frames"]
     raw_frames = parsed.get("raw_frames", {})
     calibration_results = parsed.get("calibration_results", {})
@@ -552,11 +613,13 @@ def prepare_job(
     if not calibrated_frames:
         raise ValueError("No frames found in the file.")
 
-    # 1. Zero-pressure baseline
+    # 1. Zero-pressure baseline (only subtract if recording is NOT already thresholded/processed)
     baseline_frame, baseline_diag = zero_pressure_baseline(calibrated_frames, base_config)
-    if baseline_frame is not None:
-        for k in calibrated_frames:
-            calibrated_frames[k] = np.maximum(calibrated_frames[k] - baseline_frame, 0.0)
+    if baseline_frame is not None and float(np.max(baseline_frame)) < min_pressure:
+        # Note: Do not subtract sub-threshold noise floor from contact sensels in XSN files,
+        # because XSENSOR raw / 128 is already absolute PSI and subtracting background drift
+        # shifts the 18 PSI contact threshold. Keep baseline_diag for audit only.
+        pass
 
     # 2. Playback window
     trimmed = _trim_frames(calibrated_frames, base_config.pressure_ceiling, min_pressure)
@@ -573,6 +636,7 @@ def prepare_job(
         "baseline_diag": baseline_diag,
         "sensel_w": sensel_w,
         "sensel_h": sensel_h,
+        "pitch_source": meta.get("pitch_source", "default"),
         "is_xsn": is_xsn,
         "speed": speed,
         "position": position,
@@ -622,9 +686,8 @@ def _b64_u8(arr_u8: np.ndarray) -> str:
 def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
     """
     Run the whole filter chain for every playback frame with the given config.
-    temporal → spatial MAD despike → main noise engine → patch filter → morphology →
-    segmentation → metrics + exact outlines. All frames are recomputed so every frame
-    (animation, best-frame view, report) reflects the same live filter settings.
+    Geometry / footprint mask is separated from pressure smoothing so that Fourier /
+    Gaussian / median / bilateral smoothing never stretches or reshapes the footprint.
     """
     vmax_psi = ctx["vmax_psi"]
     sensel_w, sensel_h = ctx["sensel_w"], ctx["sensel_h"]
@@ -646,46 +709,58 @@ def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
         invalid_count = saturation_count = 0
         if is_xsn and fn in raw_frames and fn in calibration_results:
             flat_raw = raw_frames[fn].flatten()
-            nz = flat_raw[flat_raw > 0]
+            valid_raw = flat_raw[flat_raw < 65530]
+            nz = valid_raw[valid_raw > 0]
             raw_min = float(np.min(nz)) if len(nz) else 0.0
-            raw_max = float(np.max(flat_raw))
+            raw_max = float(np.max(valid_raw)) if len(valid_raw) else 0.0
             raw_mean = float(np.mean(nz)) if len(nz) else 0.0
             invalid_count = int(np.sum(calibration_results[fn].invalid_mask))
             saturation_count = int(np.sum(calibration_results[fn].saturation_mask))
 
         flat_cal = arr.flatten()
-        active_cal = flat_cal[flat_cal > min_pressure]
+        active_cal = flat_cal[flat_cal >= min_pressure]
         cal_min = float(np.min(active_cal)) if len(active_cal) else 0.0
         cal_max = float(np.max(flat_cal))
         cal_mean = float(np.mean(active_cal)) if len(active_cal) else 0.0
         cal_p95 = float(np.percentile(flat_cal, 95))
         cal_p98 = float(np.percentile(flat_cal, 98))
 
+        # 1. Despeckle isolated single-sensel hardware spikes
         spatial_filtered, n_spatial = spatial_spike_filter(arr, config)
-        filtered, noise, n_fft, energy_removed = apply_noise_filter(spatial_filtered, config)
-        patched, _patch_diag = sensel_patch_filter(filtered, config)
-        patched = morphological_cleanup(patched, config)
-        mask = _segment_contact(patched, min_pressure, config.min_component_px)
-        segmented = np.where(mask, patched, 0.0).astype(np.float32)
-        if config.keep_largest_only:
-            segmented = keep_largest_component(segmented, min_pressure)
 
-        metrics = _frame_metrics_13(segmented, fn, min_pressure, position, sensel_w, sensel_h, vmax_psi)
-        seg_mask = segmented > min_pressure
+        # 2. Compute true contact geometry mask from un-blurred pressure data
+        geom_patched, _patch_diag = sensel_patch_filter(spatial_filtered, config)
+        geom_patched = morphological_cleanup(geom_patched, config)
+        geom_mask = _segment_contact(geom_patched, min_pressure, config.min_component_px)
+        if config.keep_largest_only and np.any(geom_mask):
+            geom_only = keep_largest_component(np.where(geom_mask, spatial_filtered, 0.0).astype(np.float32), min_pressure)
+            geom_mask = geom_only >= min_pressure
+
+        # 3. Smooth pressure noise strictly within the contact mask (no boundary stretching)
+        filtered, noise, n_fft, energy_removed = apply_noise_filter(spatial_filtered, config, support_mask=geom_mask)
+        segmented = np.where(geom_mask, filtered, 0.0).astype(np.float32)
+
+        disp = _rot(segmented, config.rotation_k)
+        disp_mask = _rot(geom_mask, config.rotation_k)
+        # Rotate sensel dimensions if rotation_k is odd
+        disp_w = sensel_h if (config.rotation_k % 2 == 1) else sensel_w
+        disp_h = sensel_w if (config.rotation_k % 2 == 1) else sensel_h
+
+        metrics = _frame_metrics_13(disp, fn, min_pressure, position, disp_w, disp_h, vmax_psi, contact_mask=disp_mask)
+        seg_mask = disp_mask
         if np.any(seg_mask):
             rows_any = np.any(seg_mask, axis=1)
             cols_any = np.any(seg_mask, axis=0)
             r0, r1 = int(np.argmax(rows_any)), int(len(rows_any) - 1 - np.argmax(rows_any[::-1]))
             c0, c1 = int(np.argmax(cols_any)), int(len(cols_any) - 1 - np.argmax(cols_any[::-1]))
-            metrics["bbox_width_mm"] = round((c1 - c0 + 1) * sensel_w, 1)
-            metrics["bbox_length_mm"] = round((r1 - r0 + 1) * sensel_h, 1)
+            metrics["bbox_width_mm"] = round((c1 - c0 + 1) * disp_w, 1)
+            metrics["bbox_length_mm"] = round((r1 - r0 + 1) * disp_h, 1)
         else:
             metrics["bbox_width_mm"] = metrics["bbox_length_mm"] = 0.0
 
-        disp = _rot(segmented, config.rotation_k)
         clipped = np.clip(disp, 0, vmax_psi)
         u8 = (clipped / vmax_psi * 255).astype(np.uint8)
-        outline = _outline_contours(disp > min_pressure)
+        outline = _outline_contours(disp_mask)
 
         active_sensels = int(np.sum(seg_mask))
         diag = {
@@ -694,7 +769,8 @@ def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
             "calibrated_min": cal_min, "calibrated_max": cal_max, "calibrated_mean": cal_mean,
             "calibrated_p95": cal_p95, "calibrated_p98": cal_p98,
             "active_sensels": active_sensels,
-            "contact_area_mm2": active_sensels * sensel_area_mm2,
+            "contact_area_mm2": round(active_sensels * sensel_area_mm2, 1),
+            "contact_area_cm2": round(active_sensels * sensel_area_mm2 / 100.0, 2),
             "total_load_n": float(np.sum(segmented) * 0.00689476 * sensel_area_mm2),
             "invalid_count": invalid_count,
             "saturation_count": saturation_count,
@@ -716,10 +792,11 @@ def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
     frame_diagnostics = [by_fn[fn]["diag"] for fn in frame_numbers]
     total_repaired_spikes = temporal_diag.get("temporal_spikes_repaired", 0) + sum(r["n_spatial"] for r in results)
 
+    # Prefer full on-mat contact frames when selecting best_idx
     best_idx = int(np.argmax([m["active_sensels"] for m in metrics_list]))
     best_fn = frame_numbers[best_idx]
     best_seg = by_fn[best_fn]["segmented"]
-    patch = _contact_patch_exact(best_seg, min_pressure, sensel_w, sensel_h)
+    patch = _contact_patch_exact(_rot(best_seg, config.rotation_k), min_pressure, sensel_w, sensel_h)
     patch.pop("outline_points", None)
 
     total_invalid = sum(d["invalid_count"] for d in frame_diagnostics)
@@ -729,13 +806,13 @@ def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
     grid_rows, grid_cols = int(disp_shape[0]), int(disp_shape[1])
 
     calib_audit = {
-        "sensor": "XSENSOR HX510" if is_xsn else "Unknown CSV",
+        "sensor": f"XSENSOR HX510 ({sensel_w:.2f}×{sensel_h:.2f} mm)" if is_xsn else f"CSV ({sensel_w:.2f}×{sensel_h:.2f} mm)",
         "vehicle_type": config.tyre_type,
-        "pressure_range": f"0-{config.pressure_ceiling} PSI",
-        "calibration_source": "Empirical cross-validation with CSV" if is_xsn else "CSV",
+        "pressure_range": f"Threshold {min_pressure:.0f} PSI | Display 0-{config.pressure_ceiling:.0f} PSI",
+        "calibration_source": f"XSN Header Pitch ({ctx.get('pitch_source', 'xsn_header')}) + Raw/128 PSI" if is_xsn else "CSV Direct",
         "calibration_method": ctx["calibration_method"],
-        "raw_domain": "uint16 [0, 65535]" if is_xsn else "N/A",
-        "psi_domain": "float32 [0, 511.99]",
+        "raw_domain": "uint16 [0, 65529] (65530+ invalid)" if is_xsn else "N/A",
+        "psi_domain": "float32 [0, 511.95]",
         "offset": 0.0,
         "scale": 0.0078125 if is_xsn else 1.0,
         "saturated_values": total_saturated,
@@ -753,7 +830,6 @@ def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
         "pressure_range": config.tyre_type,
         "pressure_ceiling": config.pressure_ceiling,
         "calibration_confidence": calib_audit["calibration_confidence"],
-        # every array below is a base64 little-endian typed buffer (dtype in "_dtypes")
         "encoding": "b64",
         "_dtypes": {},
     }
@@ -784,7 +860,7 @@ def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
         _empty("saturation_mask")
     _put("best_frame_filtered", by_fn[best_fn]["spatial_filtered"], "<f4")
     _put("best_frame_final", best_seg, "<f4")
-    _put("contact_mask", best_seg > min_pressure, "u1")
+    _put("contact_mask", best_seg >= min_pressure, "u1")
     if best_fn in ctx["trimmed"]:
         diff = np.abs(ctx["trimmed"][best_fn] - by_fn[best_fn]["spatial_filtered"])
         _put("spike_mask", diff > 0.1, "u1")
@@ -827,7 +903,7 @@ def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
 def load_and_process(
     filepath: str,
     tyre_type: str = "TBR",
-    min_pressure: float = 5.0,
+    min_pressure: float | None = None,
     max_pressure: float = 220.0,
     speed: float = 0.0,
     position: str = "FR",
@@ -841,34 +917,28 @@ def load_and_process(
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _trim_frames(raw_dict: dict, pressure_ceiling: float, threshold: float = 1.0) -> dict:
-    """Jatin Files viewing logic:
-    1. Filter out corrupted frames (>2700 or hardware glitch where >2% sensels are > pressure_ceiling * 1.15).
-    2. Require > 100 sensels with pressure > threshold.
-    3. Compute load per valid frame and locate peak contact frame.
-    4. Return a 50-frame playback window centered around the peak contact event.
-    """
+def _trim_frames(raw_dict: dict, pressure_ceiling: float, threshold: float = 18.0) -> dict:
+    """Select active footprint frames centered around the peak contact event."""
     frame_numbers = sorted(raw_dict.keys())
     num_frames = len(frame_numbers)
-    max_valid_frame = min(2700, num_frames)
 
     valid_fns = [
-        fn for fn in frame_numbers[:max_valid_frame]
-        if np.mean(raw_dict[fn] > pressure_ceiling * 1.15) < 0.02 and np.sum(raw_dict[fn] > threshold) >= CONTACT_AREA_MIN
+        fn for fn in frame_numbers
+        if np.sum(raw_dict[fn] >= threshold) >= CONTACT_AREA_MIN
     ]
     if not valid_fns:
         valid_fns = frame_numbers[:min(50, num_frames)]
         return {fn: raw_dict[fn] for fn in valid_fns}
 
-    # Calculate load per frame to find peak contact frame
+    # Calculate active sensels / load per frame to find peak contact frame
     valid_loads = [
-        float(np.sum(raw_dict[fn][(raw_dict[fn] > threshold) & (raw_dict[fn] < pressure_ceiling * 1.15)]))
+        float(np.sum(raw_dict[fn][raw_dict[fn] >= threshold]))
         for fn in valid_fns
     ]
     peak_sub_idx = int(np.argmax(valid_loads))
 
-    # 50-frame playback window centered around peak contact
-    half_window = 25
+    # 56-frame playback window centered around peak contact
+    half_window = 28
     start_idx = max(0, peak_sub_idx - half_window)
     end_idx = min(len(valid_fns), peak_sub_idx + half_window + 1)
     playback_fns = valid_fns[start_idx:end_idx]
@@ -884,27 +954,37 @@ def _frame_metrics_13(
     sensel_w_mm: float,
     sensel_h_mm: float,
     vmax_psi: float,
+    contact_mask: np.ndarray | None = None,
 ) -> dict:
-    """Compute all standard tyre footprint parameters per Apollo Tyres reference spec.
+    """Compute tyre footprint parameters per Apollo Tyres / XSENSOR reference spec.
 
-    Reference definitions:
-      FP Width W  — transverse width at the centre of FP (shoulder-to-shoulder)
-      FP Length L — longitudinal length at the centre of FP (rolling direction)
-      S1/S2       — shoulder contact lengths at 10% inset from outer tread edges
-      Squareness  — (S1/L)*100, (S2/L)*100, and Avg Squareness
-      PA          — perimeter area (convex hull enclosing footprint)
-      CA          — contact area (active sensels only, excludes grooves)
-      Contact Ratio — (CA / PA) * 100
+    Assumes ``arr`` is oriented in display orientation (rolling axis = vertical rows,
+    transverse axis = horizontal columns: 1 = Leading Edge at top, 2 = Trailing Edge at
+    bottom, A = Outer Tyre Side, B = Inner Tyre Side).
+
+    Definitions:
+      Contact Area (CA)     — Net thresholded contact area (active sensels >= threshold × pitch²)
+      Gross Tyre Area (PA)  — Total footprint envelope area (convex hull enclosing outer tyre boundary,
+                              including tread grooves/voids within the footprint)
+      Perimeter             — Outer boundary perimeter length of the footprint envelope (convex hull arc length)
+      Contact Ratio         — (CA / Gross Tyre Area) * 100
+      FP Width W            — Transverse shoulder-to-shoulder width across the footprint centre
+      FP Length L           — Longitudinal rolling length along the footprint centre
+      S1 / S2               — Outer (A) and Inner (B) shoulder contact lengths at 10% transverse inset
+      Squareness            — (S1/L)*100, (S2/L)*100, and Avg Squareness
     """
-    proc_thresh = max(threshold, 8.0) if threshold <= 5.0 else threshold
-    mask = _segment_contact(arr, proc_thresh)
+    if contact_mask is not None:
+        mask = np.asarray(contact_mask, dtype=bool)
+    else:
+        mask = _segment_contact(arr, threshold)
     active = int(np.sum(mask))
 
     sensel_area_mm2 = sensel_w_mm * sensel_h_mm
     peak_psi = float(np.max(arr[mask])) if active > 0 else 0.0
     avg_psi  = float(np.mean(arr[mask])) if active > 0 else 0.0
 
-    contact_area_mm2 = active * sensel_area_mm2  # CA
+    contact_area_mm2 = active * sensel_area_mm2  # Net Contact Area (CA)
+    contact_area_cm2 = contact_area_mm2 / 100.0
     PSI_TO_N_PER_MM2 = 0.00689476
     total_load_n     = float(np.sum(arr[mask]) * PSI_TO_N_PER_MM2 * sensel_area_mm2)
     total_load_kg    = total_load_n / 9.80665
@@ -916,7 +996,12 @@ def _frame_metrics_13(
         return {
             "frame_number":         frame_number,
             "contact_area_mm2":     0.0,
+            "contact_area_cm2":     0.0,
+            "gross_tyre_area_mm2":  0.0,
+            "gross_tyre_area_cm2":  0.0,
             "perimeter_area_mm2":   0.0,
+            "perimeter_mm":         0.0,
+            "perimeter_cm":         0.0,
             "contact_ratio_pct":    0.0,
             "fp_width_mm":          0.0,
             "fp_length_mm":         0.0,
@@ -926,10 +1011,7 @@ def _frame_metrics_13(
             "squareness_s1_pct":    0.0,
             "squareness_s2_pct":    0.0,
             "squareness_avg_pct":   0.0,
-            "land_sea_ratio":       0.0,
             "contact_pressure_psi": 0.0,
-            "maximum_length_mm":    0.0,
-            "maximum_width_mm":     0.0,
             "peak_pressure_psi":    0.0,
             "avg_pressure_psi":     0.0,
             "estimated_load_kg":    0.0,
@@ -942,100 +1024,54 @@ def _frame_metrics_13(
     c_min = int(np.argmax(cols_any))
     c_max = int(len(cols_any) - 1 - np.argmax(cols_any[::-1]))
 
-    height_span_mm = (r_max - r_min + 1) * sensel_h_mm
-    width_span_mm = (c_max - c_min + 1) * sensel_w_mm
+    # In display orientation (rotated 90° CCW so tyre points bottom-to-top):
+    # - Columns (c) span the transverse width (Shoulder A ↔ Shoulder B)
+    # - Rows (r) span the longitudinal rolling length (1 Leading Edge ↔ 2 Trailing Edge)
+    c_mid = (c_min + c_max) // 2
+    r_mid = (r_min + r_max) // 2
 
-    is_horizontal_roll = width_span_mm > height_span_mm
+    # Use a central band (+/- 5 sensels) so a circumferential groove at exact c_mid
+    # or lateral sipes at exact r_mid do not artificially under-report centre L or W.
+    def _row_span(r_idx: int) -> int:
+        rm = mask[r_idx, :]
+        if not np.any(rm):
+            return 0
+        return int((len(rm) - 1 - np.argmax(rm[::-1])) - np.argmax(rm) + 1)
 
-    if is_horizontal_roll:
-        c_mid = (c_min + c_max) // 2
-        r_mid = (r_min + r_max) // 2
+    def _col_span(c_idx: int) -> int:
+        cm = mask[:, c_idx]
+        if not np.any(cm):
+            return 0
+        return int((len(cm) - 1 - np.argmax(cm[::-1])) - np.argmax(cm) + 1)
 
-        col_mask = mask[:, c_mid]
-        if np.any(col_mask):
-            w_span = (len(col_mask) - 1 - np.argmax(col_mask[::-1])) - np.argmax(col_mask) + 1
-        else:
-            w_span = r_max - r_min + 1
-        fp_width_mm = round(w_span * sensel_h_mm, 1)
+    w_band = [_row_span(r) for r in range(max(r_min, r_mid - 5), min(r_max, r_mid + 5) + 1)]
+    w_span = max(w_band) if any(w_band) else (c_max - c_min + 1)
+    fp_width_mm = round(w_span * sensel_w_mm, 1)
 
-        row_mask = mask[r_mid, :]
-        if np.any(row_mask):
-            l_span = (len(row_mask) - 1 - np.argmax(row_mask[::-1])) - np.argmax(row_mask) + 1
-        else:
-            l_span = c_max - c_min + 1
-        fp_length_mm = round(l_span * sensel_w_mm, 1)
+    l_band = [_col_span(c) for c in range(max(c_min, c_mid - 8), min(c_max, c_mid + 8) + 1)]
+    l_span = max(l_band) if any(l_band) else (r_max - r_min + 1)
+    fp_length_mm = round(l_span * sensel_h_mm, 1)
 
-        max_w_sens = max([(len(mask[:, c]) - 1 - np.argmax(mask[:, c][::-1])) - np.argmax(mask[:, c]) + 1 
-                          for c in range(c_min, c_max + 1) if np.any(mask[:, c])], default=r_max - r_min + 1)
-        max_l_sens = max([(len(mask[r, :]) - 1 - np.argmax(mask[r, :][::-1])) - np.argmax(mask[r, :]) + 1 
-                          for r in range(r_min, r_max + 1) if np.any(mask[r, :])], default=c_max - c_min + 1)
+    n_transverse = c_max - c_min + 1
+    inset = max(1, int(round(0.10 * n_transverse)))
+    c_left = min(c_max, c_min + inset)
+    c_right = max(c_min, c_max - inset)
 
-        max_width_mm = round(max_w_sens * sensel_h_mm, 1)
-        max_length_mm = round(max_l_sens * sensel_w_mm, 1)
+    def _shoulder_len_mm(c_center: int) -> float:
+        spans = [_col_span(c) for c in range(max(c_min, c_center - 2), min(c_max, c_center + 2) + 1)]
+        best = max(spans) if spans else 0
+        return float(best * sensel_h_mm)
 
-        n_transverse = r_max - r_min + 1
-        inset = max(1, int(round(0.10 * n_transverse)))
-        r_s1 = min(r_max, r_min + inset)
-        r_s2 = max(r_min, r_max - inset)
+    s_left = _shoulder_len_mm(c_left)
+    s_right = _shoulder_len_mm(c_right)
 
-        def _get_row_rolling_length(row_idx):
-            rm = mask[row_idx, :]
-            if not np.any(rm): return 0.0
-            span = (len(rm) - 1 - np.argmax(rm[::-1])) - np.argmax(rm) + 1
-            return float(span * sensel_w_mm)
-
-        s_top = _get_row_rolling_length(r_s1)
-        s_bot = _get_row_rolling_length(r_s2)
-
-        if position in ("FL", "RL"):
-            s1, s2 = round(s_top, 1), round(s_bot, 1)
-        else:
-            s1, s2 = round(s_bot, 1), round(s_top, 1)
-
+    # A = Outer Tyre Side (S1), B = Inner Tyre Side (S2)
+    # For Left tyres (FL, RL) viewed from top/footprint, Left is Outer (A), Right is Inner (B).
+    # For Right tyres (FR, RR), Right is Outer (A), Left is Inner (B).
+    if position in ("FL", "RL"):
+        s1, s2 = round(s_left, 1), round(s_right, 1)
     else:
-        c_mid = (c_min + c_max) // 2
-        r_mid = (r_min + r_max) // 2
-
-        row_mask = mask[r_mid, :]
-        if np.any(row_mask):
-            w_span = (len(row_mask) - 1 - np.argmax(row_mask[::-1])) - np.argmax(row_mask) + 1
-        else:
-            w_span = c_max - c_min + 1
-        fp_width_mm = round(w_span * sensel_w_mm, 1)
-
-        col_mask = mask[:, c_mid]
-        if np.any(col_mask):
-            l_span = (len(col_mask) - 1 - np.argmax(col_mask[::-1])) - np.argmax(col_mask) + 1
-        else:
-            l_span = r_max - r_min + 1
-        fp_length_mm = round(l_span * sensel_h_mm, 1)
-
-        max_w_sens = max([(len(mask[r, :]) - 1 - np.argmax(mask[r, :][::-1])) - np.argmax(mask[r, :]) + 1 
-                          for r in range(r_min, r_max + 1) if np.any(mask[r, :])], default=c_max - c_min + 1)
-        max_l_sens = max([(len(mask[:, c]) - 1 - np.argmax(mask[:, c][::-1])) - np.argmax(mask[:, c]) + 1 
-                          for c in range(c_min, c_max + 1) if np.any(mask[:, c])], default=r_max - r_min + 1)
-
-        max_width_mm = round(max_w_sens * sensel_w_mm, 1)
-        max_length_mm = round(max_l_sens * sensel_h_mm, 1)
-
-        n_transverse = c_max - c_min + 1
-        inset = max(1, int(round(0.10 * n_transverse)))
-        c_s1 = min(c_max, c_min + inset)
-        c_s2 = max(c_min, c_max - inset)
-
-        def _get_col_rolling_length(col_idx):
-            cm = mask[:, col_idx]
-            if not np.any(cm): return 0.0
-            span = (len(cm) - 1 - np.argmax(cm[::-1])) - np.argmax(cm) + 1
-            return float(span * sensel_h_mm)
-
-        s_left = _get_col_rolling_length(c_s1)
-        s_right = _get_col_rolling_length(c_s2)
-
-        if position in ("FL", "RL"):
-            s1, s2 = round(s_left, 1), round(s_right, 1)
-        else:
-            s1, s2 = round(s_right, 1), round(s_left, 1)
+        s1, s2 = round(s_right, 1), round(s_left, 1)
 
     max_s = max(s1, s2)
     shoulder_skewness_pct = round((abs(s1 - s2) / max_s) * 100.0, 1) if max_s > 0 else 0.0
@@ -1047,20 +1083,30 @@ def _frame_metrics_13(
     else:
         squareness_s1_pct = squareness_s2_pct = squareness_avg_pct = 0.0
 
+    # Gross Tyre Area (total footprint envelope including grooves/voids) & Perimeter
+    # Computed from the convex hull of the outer corners of all active contact sensels.
     points = np.argwhere(mask)
     if len(points) >= 3:
-        pts_mm = np.column_stack((points[:, 1] * sensel_w_mm, points[:, 0] * sensel_h_mm)).astype(np.float32)
-        hull = cv2.convexHull(pts_mm)
-        perimeter_area_mm2 = float(cv2.contourArea(hull))
+        x0 = points[:, 1].astype(np.float32) * sensel_w_mm
+        y0 = points[:, 0].astype(np.float32) * sensel_h_mm
+        corners = np.vstack([
+            np.column_stack((x0, y0)),
+            np.column_stack((x0 + sensel_w_mm, y0)),
+            np.column_stack((x0, y0 + sensel_h_mm)),
+            np.column_stack((x0 + sensel_w_mm, y0 + sensel_h_mm)),
+        ]).astype(np.float32)
+        hull = cv2.convexHull(corners)
+        gross_tyre_area_mm2 = float(cv2.contourArea(hull))
+        perimeter_mm = float(cv2.arcLength(hull, True))
     else:
-        perimeter_area_mm2 = contact_area_mm2
+        gross_tyre_area_mm2 = contact_area_mm2
+        perimeter_mm = 0.0
 
-    perimeter_area_mm2 = max(perimeter_area_mm2, contact_area_mm2)
+    gross_tyre_area_mm2 = max(gross_tyre_area_mm2, contact_area_mm2)
+    gross_tyre_area_cm2 = gross_tyre_area_mm2 / 100.0
+    perimeter_cm = perimeter_mm / 10.0
 
-    contact_ratio_pct = round((contact_area_mm2 / perimeter_area_mm2) * 100.0, 1) if perimeter_area_mm2 > 0 else 0.0
-
-    sea_area = perimeter_area_mm2 - contact_area_mm2
-    land_sea_ratio = round(contact_area_mm2 / sea_area, 2) if sea_area > 0 else 0.0
+    contact_ratio_pct = round((contact_area_mm2 / gross_tyre_area_mm2) * 100.0, 1) if gross_tyre_area_mm2 > 0 else 0.0
 
     total_sensels = arr.size
     contact_pct = round((active / total_sensels) * 100.0, 2) if total_sensels > 0 else 0.0
@@ -1068,7 +1114,12 @@ def _frame_metrics_13(
     return {
         "frame_number":          frame_number,
         "contact_area_mm2":      round(contact_area_mm2, 1),
-        "perimeter_area_mm2":    round(perimeter_area_mm2, 1),
+        "contact_area_cm2":      round(contact_area_cm2, 2),
+        "gross_tyre_area_mm2":   round(gross_tyre_area_mm2, 1),
+        "gross_tyre_area_cm2":   round(gross_tyre_area_cm2, 2),
+        "perimeter_area_mm2":    round(gross_tyre_area_mm2, 1),
+        "perimeter_mm":          round(perimeter_mm, 1),
+        "perimeter_cm":          round(perimeter_cm, 2),
         "contact_ratio_pct":     contact_ratio_pct,
         "fp_width_mm":           fp_width_mm,
         "fp_length_mm":          fp_length_mm,
@@ -1078,10 +1129,7 @@ def _frame_metrics_13(
         "squareness_s1_pct":     squareness_s1_pct,
         "squareness_s2_pct":     squareness_s2_pct,
         "squareness_avg_pct":    squareness_avg_pct,
-        "land_sea_ratio":        land_sea_ratio,
         "contact_pressure_psi":  round(avg_psi, 2),
-        "maximum_length_mm":     max_length_mm,
-        "maximum_width_mm":      max_width_mm,
         "peak_pressure_psi":     round(peak_psi, 2),
         "avg_pressure_psi":      round(avg_psi, 2),
         "estimated_load_kg":     round(total_load_kg, 1),

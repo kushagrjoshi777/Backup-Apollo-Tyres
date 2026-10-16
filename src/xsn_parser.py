@@ -203,6 +203,27 @@ class XSNReader:
 
         return 1_000_000 / median_delta
 
+    def sensel_pitch_mm(self) -> tuple[float, float] | None:
+        """Extract sensel width and height (mm) from the XSN binary header if available.
+
+        XSENSOR HX510 headers store sensor geometry after the ``HSS\\x00`` signature
+        as little-endian float32 values: ``[40.0, 40.0, pitch_w_mm, pitch_h_mm]``
+        (e.g. 1.56 mm × 1.56 mm for a 256×256 40 cm × 40 cm sensor pad).
+        """
+        search_limit = min(self.size, self.frames[0].offset if self.frames else 700_000)
+        head = self.mm[:search_limit]
+        pos = 0
+        while True:
+            idx = head.find(b"HSS\x00", pos)
+            if idx < 0 or idx + 56 > len(head):
+                break
+            vals = struct.unpack_from("<14f", head, idx)
+            pw, ph = float(vals[12]), float(vals[13])
+            if 0.5 <= pw <= 10.0 and 0.5 <= ph <= 10.0 and not (np.isnan(pw) or np.isnan(ph)):
+                return round(pw, 4), round(ph, 4)
+            pos = idx + 4
+        return None
+
 
 # ---------------------------------------------------------
 # Empirically calibrated raw → PSI conversion
@@ -217,7 +238,7 @@ class XSNReader:
 # ---------------------------------------------------------
 
 _XSN_CALIBRATION_DIVISOR: float = 128.0
-_XSN_NOISE_THRESHOLD_PSI: float = 5.0
+_XSN_NOISE_THRESHOLD_PSI: float = 18.0
 
 
 def raw_to_psi(
@@ -233,7 +254,7 @@ def raw_to_psi(
     raw : ndarray
         Raw uint16 matrix from XSNReader.get_frame().
     threshold_psi : float
-        Values below this are set to 0 (matching CSV export behaviour).
+        Values below this are set to 0 (default 18.0 PSI for TBR).
         Set to 0.0 to disable thresholding.
 
     Returns
@@ -243,10 +264,10 @@ def raw_to_psi(
     """
     psi = raw.astype(np.float32) / _XSN_CALIBRATION_DIVISOR
 
-    # 65535 appears as saturation / invalid in raw recordings.
-    psi[raw >= 65535] = np.nan
+    # 65530+ (including 65535 = 0xFFFF) appears as invalid / dead sensel or ADC saturation.
+    psi[raw >= 65530] = np.nan
 
-    # Zero out sub-threshold values (matches CSV Threshold = 5.0 PSI).
+    # Zero out sub-threshold values.
     if threshold_psi > 0.0:
         psi[psi < threshold_psi] = 0.0
 
@@ -254,35 +275,44 @@ def raw_to_psi(
 
 
 def calibrate_frame(raw: np.ndarray, tyre_type: str = "TBR", pressure_ceiling: float = 220.0) -> CalibrationResult:
-    """Calibrate raw uint16 frame and compute invalid/saturation masks."""
-    calibrated = raw.astype(np.float32) / 128.0
-    
-    # 65530+ is typically saturation/invalid
-    saturation_mask = (raw >= 65530)
-    
-    # Check for NaN, inf, or negative raw
-    invalid_mask = np.isnan(calibrated) | np.isinf(calibrated) | (raw < 0)
-    
-    # If the frame has contact but there are exact 0 raw values, mark them as invalid?
-    # Based on instructions: "where raw == 0 and the frame has clear contact elsewhere"
-    has_contact = np.sum(calibrated > 5.0) > 100
-    if has_contact:
-        invalid_mask |= (raw == 0)
+    """Calibrate raw uint16 frame and compute invalid/saturation masks.
 
-    # Suspicious values > pressure_ceiling * 1.15
-    suspicious = calibrated > pressure_ceiling * 1.15
-    calibrated[suspicious] = 0.0
-    saturation_mask |= suspicious
-    
+    Raw values >= 65530 (such as 65535 / 0xFFFF) represent hardware invalid /
+    saturated sensel codes and are excluded from contact geometry and pressure
+    statistics (set to 0.0 in calibrated_psi and flagged in invalid_mask and
+    saturation_mask). Legitimate high local tread pressures (< 65530, i.e. up to
+    ~511.9 PSI) are preserved rather than zeroed at the nominal display ceiling.
+    """
+    calibrated = raw.astype(np.float32) / _XSN_CALIBRATION_DIVISOR
+
+    # 65530+ (specifically 65535 = 0xFFFF) is hardware saturation / dead sensel code
+    hw_invalid = (raw >= 65530)
+
+    # Check for NaN, inf, negative raw, or hardware invalid code
+    invalid_mask = np.isnan(calibrated) | np.isinf(calibrated) | (raw < 0) | hw_invalid
+
+    # Track sensels exceeding nominal display ceiling (e.g. 220 PSI) or hardware saturation
+    saturation_mask = hw_invalid.copy()
+
+    # Zero out invalid / hardware-saturated sensels so they never corrupt geometry or statistics
+    calibrated[invalid_mask] = 0.0
+
+    # If the frame has contact but there are exact 0 raw values inside, record in invalid_mask
+    # for diagnostic traceability without altering valid sensels.
+    thresh_check = 18.0 if tyre_type.upper() == "TBR" else 5.0
+    has_contact = np.sum(calibrated >= thresh_check) > 100
+    if has_contact:
+        invalid_mask = invalid_mask | (raw == 0)
+
     # Enforce non-negative
-    calibrated = np.maximum(calibrated, 0)
-    
+    calibrated = np.maximum(calibrated, 0.0)
+
     return CalibrationResult(
         calibrated_psi=calibrated,
         raw_frame=raw.copy(),
         invalid_mask=invalid_mask,
         saturation_mask=saturation_mask,
-        calibration_method="EMPIRICAL_FALLBACK_RAW_DIV_128",
+        calibration_method="EMPIRICAL_RAW_DIV_128",
         pressure_range=tyre_type,
         pressure_ceiling=pressure_ceiling,
         confidence="EMPIRICAL"

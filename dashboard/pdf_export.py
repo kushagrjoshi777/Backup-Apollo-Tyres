@@ -34,23 +34,28 @@ for _i in range(256):
     ]
 
 # (metric key, row label, decimals)
+# Per stakeholder requirements:
+# - Remove Maximum Length, Maximum Width, and Land/Sea Ratio
+# - Add Perimeter and Gross Tyre Area (clearly distinguished from thresholded Contact Area)
+# - 1 = Leading Edge; 2 = Trailing Edge; A = Outer Tyre Side; B = Inner Tyre Side
 PARAMS = [
-    ("contact_area_mm2",     "Contact area (mm\u00b2)",   1),
-    ("contact_ratio_pct",    "Contact ratio (%)",         1),
-    ("fp_width_mm",          "FP width (mm)",             1),
-    ("fp_length_mm",         "FP length (mm)",            1),
-    ("outer_shoulder_s1_mm", "Outer shoulder S1 (mm)",    1),
-    ("inner_shoulder_s2_mm", "Inner shoulder S2 (mm)",    1),
-    ("shoulder_skewness_pct", "Shoulder skewness (%)",    1),
-    ("squareness_s1_pct",    "Squareness S1 (%)",         1),
-    ("squareness_s2_pct",    "Squareness S2 (%)",         1),
-    ("squareness_avg_pct",   "Squareness avg (%)",        1),
-    ("land_sea_ratio",       "Land / sea ratio",          2),
-    ("contact_pressure_psi", "Contact pressure (PSI)",    1),
-    ("maximum_length_mm",    "Maximum length (mm)",       1),
-    ("maximum_width_mm",     "Maximum width (mm)",        1),
-    ("peak_pressure_psi",    "Peak pressure (PSI)",       1),
-    ("estimated_load_kg",    "Estimated load (kg)",       1),
+    ("contact_area_mm2",     "Contact area (mm\u00b2)",               1),
+    ("contact_area_cm2",     "Contact area (cm\u00b2)",               2),
+    ("gross_tyre_area_mm2",  "Gross tyre area (mm\u00b2)",            1),
+    ("gross_tyre_area_cm2",  "Gross tyre area (cm\u00b2)",            2),
+    ("perimeter_mm",         "Perimeter (mm)",                        1),
+    ("contact_ratio_pct",    "Contact ratio (%)",                     1),
+    ("fp_width_mm",          "FP width (mm)",                         1),
+    ("fp_length_mm",         "FP length (mm)",                        1),
+    ("outer_shoulder_s1_mm", "A \u2014 Outer tyre side S1 (mm)",      1),
+    ("inner_shoulder_s2_mm", "B \u2014 Inner tyre side S2 (mm)",      1),
+    ("shoulder_skewness_pct", "Shoulder skewness (%)",                1),
+    ("squareness_s1_pct",    "Squareness A / S1 (%)",                 1),
+    ("squareness_s2_pct",    "Squareness B / S2 (%)",                 1),
+    ("squareness_avg_pct",   "Squareness avg (%)",                    1),
+    ("contact_pressure_psi", "Contact pressure (PSI)",                1),
+    ("peak_pressure_psi",    "Peak pressure (PSI)",                   1),
+    ("estimated_load_kg",    "Estimated load (kg)",                   1),
 ]
 
 FILTER_LABELS = {
@@ -81,7 +86,7 @@ def _filter_description(cfg: dict) -> str:
         extra = f" ({cfg.get('median_size', 3)}x{cfg.get('median_size', 3)})"
     elif kind == "bilateral":
         extra = f" (colour {cfg.get('bilateral_sigma_color', 0):.0f} PSI, space {cfg.get('bilateral_sigma_space', 0):.1f})"
-    return f"{label}{extra}; noise floor {cfg.get('min_pressure', 0):.1f} PSI"
+    return f"{label}{extra}; threshold {cfg.get('min_pressure', 18):.1f} PSI"
 
 
 def _decode_frame(data: dict, fn: int) -> np.ndarray:
@@ -94,27 +99,71 @@ def _decode_frame(data: dict, fn: int) -> np.ndarray:
     return arr.reshape(rows, cols)
 
 
-def _render_tyre_png(u8: np.ndarray, outlines: list, scale: int = 6) -> tuple[bytes, float]:
-    """Jet heatmap + dense bounding-edge polygon. Returns (png_bytes, height/width)."""
+def _render_tyre_png(u8: np.ndarray, outlines: list, pos: str = "FR", scale: int = 5) -> tuple[bytes, float]:
+    """Jet heatmap + pink footprint boundary lines + 1/2 (Leading/Trailing) & A/B (Outer/Inner) callouts."""
     rgb = JET_LUT[u8].copy()
     rgb[u8 == 0] = [255, 255, 255]
     rows, cols = u8.shape
-    img = PILImage.fromarray(rgb).resize((cols * scale, rows * scale), PILImage.NEAREST)
+    hm_w, hm_h = cols * scale, rows * scale
+    pad_top, pad_bot, pad_lr = 44, 44, 52
+    canvas_w = hm_w + 2 * pad_lr
+    canvas_h = hm_h + pad_top + pad_bot
+
+    img = PILImage.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
+    hm_img = PILImage.fromarray(rgb).resize((hm_w, hm_h), PILImage.NEAREST)
+    img.paste(hm_img, (pad_lr, pad_top))
+
     draw = ImageDraw.Draw(img)
+    # Subtle frame around sensor grid
+    draw.rectangle([pad_lr - 1, pad_top - 1, pad_lr + hm_w, pad_top + hm_h], outline=(220, 224, 230), width=2)
+
+    # Pink footprint boundary lines (#FF1493 / #D81B60) with subtle white halo for contrast
     for flat in outlines or []:
-        pts = [(flat[i] * scale, flat[i + 1] * scale) for i in range(0, len(flat) - 1, 2)]
+        pts = [(pad_lr + flat[i] * scale, pad_top + flat[i + 1] * scale) for i in range(0, len(flat) - 1, 2)]
         if len(pts) >= 3:
-            draw.line(pts + [pts[0]], fill=(20, 20, 20), width=3, joint="curve")
+            closed = pts + [pts[0]]
+            draw.line(closed, fill=(255, 255, 255), width=6, joint="curve")
+            draw.line(closed, fill=(233, 30, 99), width=4, joint="curve")
+
+    # Edge & Side orientation labels:
+    # 1 = Leading Edge (top); 2 = Trailing Edge (bottom)
+    # A = Outer Tyre Side; B = Inner Tyre Side
+    is_left_tyre = str(pos).upper() in ("FL", "RL")
+    left_code = "A" if is_left_tyre else "B"
+    right_code = "B" if is_left_tyre else "A"
+    left_sub = "Outer" if is_left_tyre else "Inner"
+    right_sub = "Inner" if is_left_tyre else "Outer"
+
+    pink_rgb = (216, 27, 96)
+    dark_rgb = (40, 48, 60)
+    # Top: 1 (Leading Edge)
+    draw.text((canvas_w // 2 - 42, 12), "1 (Leading Edge)", fill=pink_rgb)
+    # Bottom: 2 (Trailing Edge)
+    draw.text((canvas_w // 2 - 44, pad_top + hm_h + 14), "2 (Trailing Edge)", fill=pink_rgb)
+    # Left & Right sides: A / B
+    cy = pad_top + hm_h // 2
+    draw.text((8, cy - 12), f"{left_code}", fill=pink_rgb)
+    draw.text((4, cy + 2), f"({left_sub})", fill=dark_rgb)
+    draw.text((pad_lr + hm_w + 14, cy - 12), f"{right_code}", fill=pink_rgb)
+    draw.text((pad_lr + hm_w + 6, cy + 2), f"({right_sub})", fill=dark_rgb)
+
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    return buf.getvalue(), rows / cols
+    return buf.getvalue(), canvas_h / canvas_w
 
 
-def _placeholder_png(w: int = 400, h: int = 400) -> bytes:
+def _placeholder_png(pos: str = "FL", w: int = 440, h: int = 420) -> bytes:
     img = PILImage.new("RGB", (w, h), (255, 255, 255))
     d = ImageDraw.Draw(img)
-    d.rectangle([4, 4, w - 5, h - 5], outline=(215, 215, 215), width=3)
-    d.text((w // 2 - 30, h // 2 - 5), "No data", fill=(170, 170, 170))
+    d.rectangle([36, 28, w - 37, h - 29], outline=(215, 215, 215), width=2)
+    is_left = str(pos).upper() in ("FL", "RL")
+    l_lbl = "A (Outer)" if is_left else "B (Inner)"
+    r_lbl = "B (Inner)" if is_left else "A (Outer)"
+    d.text((w // 2 - 40, 8), "1 (Leading Edge)", fill=(170, 170, 170))
+    d.text((w // 2 - 42, h - 22), "2 (Trailing Edge)", fill=(170, 170, 170))
+    d.text((4, h // 2 - 6), l_lbl[:1], fill=(170, 170, 170))
+    d.text((w - 20, h // 2 - 6), r_lbl[:1], fill=(170, 170, 170))
+    d.text((w // 2 - 26, h // 2 - 6), "No data", fill=(170, 170, 170))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -128,9 +177,9 @@ def _generate_colorbar_png(vmin: float, vmax: float) -> bytes:
         arr[y, :] = JET_LUT[int((1.0 - y / (h - 1)) * 255)]
     pil_img = PILImage.fromarray(arr)
     draw = ImageDraw.Draw(pil_img)
-    ticks = [300, 284, 268, 253, 237, 222, 206, 191, 175, 160, 144, 129, 113, 98, 82, 67, 51, 36, 20, 5]
+    ticks = [300, 284, 268, 253, 237, 222, 206, 191, 175, 160, 144, 129, 113, 98, 82, 67, 51, 36, 18]
     if vmax <= 220:
-        ticks = [220, 205, 190, 175, 160, 145, 130, 115, 100, 85, 70, 55, 40, 25, 10, 5]
+        ticks = [220, 205, 190, 175, 160, 145, 130, 115, 100, 85, 70, 55, 40, 25, int(round(vmin))]
     for val in ticks:
         norm = (val - vmin) / (vmax - vmin) if vmax > vmin else 0
         norm = float(np.clip(norm, 0, 1))
@@ -157,7 +206,7 @@ def _mean_metrics(rows: list) -> dict:
 
 def _param_table(values: dict | None, width_mm: float, title: str | None = None) -> Table:
     """Compact two-column table (Parameter | Value) used directly under each tyre."""
-    label_w = width_mm * 0.62
+    label_w = width_mm * 0.65
     rows = []
     if title:
         rows.append([title, ""])
@@ -166,13 +215,13 @@ def _param_table(values: dict | None, width_mm: float, title: str | None = None)
     t = Table(rows, colWidths=[label_w * mm, (width_mm - label_w) * mm])
     style = [
         ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-        ('FONTSIZE', (0, 0), (-1, -1), 7),
+        ('FONTSIZE', (0, 0), (-1, -1), 6.6),
         ('ALIGN', (0, 0), (0, -1), 'LEFT'),
         ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
         ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
         ('GRID', (0, 0), (-1, -1), 0.4, GRID),
-        ('TOPPADDING', (0, 0), (-1, -1), 2.2),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 2.2),
+        ('TOPPADDING', (0, 0), (-1, -1), 1.8),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 1.8),
         ('LEFTPADDING', (0, 0), (-1, -1), 3),
         ('RIGHTPADDING', (0, 0), (-1, -1), 4),
         ('FONTNAME', (1, 1 if not title else 1), (1, -1), 'Helvetica-Bold'),
@@ -202,7 +251,7 @@ def generate_report_pdf(data: dict, speed: float, frames: list) -> bytes:
     page = landscape(A4)
     doc = SimpleDocTemplate(
         buffer, pagesize=page,
-        topMargin=8 * mm, bottomMargin=8 * mm, leftMargin=8 * mm, rightMargin=8 * mm,
+        topMargin=6 * mm, bottomMargin=6 * mm, leftMargin=8 * mm, rightMargin=8 * mm,
         title="Footprint Analysis Report (Dynamic Model)",
     )
     styles = getSampleStyleSheet()
@@ -218,29 +267,33 @@ def generate_report_pdf(data: dict, speed: float, frames: list) -> bytes:
 
     el = []
     title_style = ParagraphStyle(
-        'MainTitle', parent=styles['Heading1'], fontSize=21, fontName='Helvetica-Bold',
+        'MainTitle', parent=styles['Heading1'], fontSize=19, fontName='Helvetica-Bold',
         textColor=black, spaceAfter=1, alignment=0,
     )
     dyn_style = ParagraphStyle(
-        'Dyn', parent=styles['Normal'], fontSize=11, fontName='Helvetica-Bold',
+        'Dyn', parent=styles['Normal'], fontSize=10.5, fontName='Helvetica-Bold',
         textColor=PINK, spaceAfter=2,
     )
     sub_style = ParagraphStyle(
-        'Sub', parent=styles['Normal'], fontSize=8.5, fontName='Helvetica',
-        textColor=HexColor('#444444'), spaceAfter=1, leading=11,
+        'Sub', parent=styles['Normal'], fontSize=8, fontName='Helvetica',
+        textColor=HexColor('#444444'), spaceAfter=1, leading=10.5,
     )
     el.append(Paragraph("Footprint Analysis Report", title_style))
     el.append(Paragraph("(DYNAMIC MODEL)", dyn_style))
     src = data.get("source_file") or ""
+    pitch_w = data.get("sensel_w_mm", 1.56)
+    pitch_h = data.get("sensel_h_mm", 1.56)
     el.append(Paragraph(
         f"Apollo Tyres &nbsp;|&nbsp; Speed {speed_val} km/h &nbsp;|&nbsp; Position {pos} "
-        f"&nbsp;|&nbsp; {data.get('tyre_type', '')} &nbsp;|&nbsp; File {src}", sub_style))
+        f"&nbsp;|&nbsp; {data.get('tyre_type', 'TBR')} (Threshold {data.get('vmin', 18.0):.0f} PSI, Pitch {pitch_w:.2f}&times;{pitch_h:.2f} mm) "
+        f"&nbsp;|&nbsp; File {src}", sub_style))
     el.append(Paragraph(
         f"<b>Frames used ({len(sel)}):</b> {', '.join(str(f) for f in sel)} &nbsp;&mdash;&nbsp; "
         f"values are the {'mean of these frames' if len(sel) > 1 else 'values of this frame'}. "
         f"<b>Noise filter:</b> {_filter_description(cfg)}. "
-        f"<b>Rolling direction:</b> bottom to top.", sub_style))
-    el.append(Spacer(1, 2 * mm))
+        f"<b>Orientation Legend:</b> <b>1</b> = Leading Edge, <b>2</b> = Trailing Edge; "
+        f"<b>A</b> = Outer Tyre Side, <b>B</b> = Inner Tyre Side.", sub_style))
+    el.append(Spacer(1, 1.5 * mm))
 
     # ── Four tyres side by side, tables directly beneath ──
     COL_W = 62.0  # mm
@@ -248,12 +301,11 @@ def generate_report_pdf(data: dict, speed: float, frames: list) -> bytes:
     primary = sel[0]
     u8 = _decode_frame(data, primary)
     outline = (data.get("outlines") or {}).get(str(primary), [])
-    tyre_png, aspect = _render_tyre_png(u8, outline)
-    placeholder = _placeholder_png()
+    tyre_png, aspect = _render_tyre_png(u8, outline, pos=pos)
 
-    img_w = 56.0
+    img_w = 54.0
     img_h = img_w * aspect
-    max_h = 58.0
+    max_h = 52.0
     if img_h > max_h:
         img_h, img_w = max_h, max_h / aspect
 
@@ -266,7 +318,8 @@ def generate_report_pdf(data: dict, speed: float, frames: list) -> bytes:
             images.append(Image(io.BytesIO(tyre_png), width=img_w * mm, height=img_h * mm))
             tables.append(_param_table(mean_vals, COL_W - 3))
         else:
-            images.append(Image(io.BytesIO(placeholder), width=img_w * mm, height=img_w * aspect * mm if aspect else img_w * mm))
+            ph_png = _placeholder_png(pos=p)
+            images.append(Image(io.BytesIO(ph_png), width=img_w * mm, height=img_h * mm))
             tables.append(_param_table(None, COL_W - 3))
 
     cbar = Image(io.BytesIO(_generate_colorbar_png(data.get("vmin", 5), data.get("vmax", 220))),
@@ -299,7 +352,7 @@ def generate_report_pdf(data: dict, speed: float, frames: list) -> bytes:
         el.append(Spacer(1, 3 * mm))
         cells_h, cells_i, cells_t = [], [], []
         for fn in sel:
-            png, asp = _render_tyre_png(_decode_frame(data, fn), (data.get("outlines") or {}).get(str(fn), []))
+            png, asp = _render_tyre_png(_decode_frame(data, fn), (data.get("outlines") or {}).get(str(fn), []), pos=pos)
             w = 56.0
             h = w * asp
             if h > 58.0:

@@ -130,6 +130,9 @@ def parse_xsn_lazy(filepath: str, max_frames: int = 2000, tyre_type: str = "TBR"
             raise ValueError(f"No frames found in XSN file: {filepath!r}")
 
         frame_rate = reader.frame_rate()
+        pitch = reader.sensel_pitch_mm()
+        sensel_w_mm = pitch[0] if pitch else 1.56
+        sensel_h_mm = pitch[1] if pitch else 1.56
 
         n_to_read = min(total_frames, max_frames)
         frames: dict[int, np.ndarray] = {}
@@ -157,9 +160,11 @@ def parse_xsn_lazy(filepath: str, max_frames: int = 2000, tyre_type: str = "TBR"
         "raw_frames": raw_frames,
         "calibration_results": calibration_results,
         "frame_rate": frame_rate,
+        "sensel_width_mm": sensel_w_mm,
+        "sensel_height_mm": sensel_h_mm,
         "total_frames": total_frames,
         "is_provisional": False,
-        "calibration_method": "EMPIRICAL_FALLBACK_RAW_DIV_128",
+        "calibration_method": "EMPIRICAL_RAW_DIV_128",
         "calibration_confidence": "EMPIRICAL",
         "raw_diagnostics": first_frame_diagnostics,
     }

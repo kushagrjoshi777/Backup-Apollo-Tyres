@@ -9,6 +9,8 @@ data/
 dashboard/uploads/
 build/
 dist/
+*.xsn
+*.exe
 *.spec
 
 Jatin Files/
@@ -20,3 +22,7 @@ xsn_*.png
 diag_xsn.py
 scratch_inspect.py
 update.py
+compare_xsn.py
+debug_diagnostics.py
+xsn_comparison.txt
+xsn_diagnostic_report.md
