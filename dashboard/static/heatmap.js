@@ -62,46 +62,55 @@ function drawHeatmap(canvas, data, W = 256, H = 256) {
 }
 
 /**
- * Draw the EXACT tyre outline on the overlay canvas using per-row edge points.
- * Renders a thin dark stroke polygon that matches the real tyre contact boundary,
- * NOT a rectangular bounding box.
+ * Draw the exact bounding edge of the tyre on an overlay canvas.
+ *
+ * The overlay is sized to the *displayed* pixel size (× devicePixelRatio) instead of the
+ * sensel grid, so the line stays razor sharp. Contours come from the backend as dense,
+ * sub-sensel polygons (flat [x0,y0,x1,y1,…] arrays in sensel units) computed PER FRAME,
+ * so the edge always travels with the tyre.
  *
  * @param {HTMLCanvasElement} overlayCanvas
- * @param {Array<{x:number, y:number}>} outlinePoints  – polygon vertices in sensel coords
- * @param {number} gridW  – sensel grid width  (e.g. 256 or 129)
- * @param {number} gridH  – sensel grid height (e.g. 256 or 126)
+ * @param {Array<number[]>} contours  – list of flat coordinate arrays
+ * @param {number} gridW  – sensel grid width
+ * @param {number} gridH  – sensel grid height
  */
-function drawTyreOutline(overlayCanvas, outlinePoints, gridW = 256, gridH = 256) {
+function drawTyreOutline(overlayCanvas, contours, gridW = 256, gridH = 256) {
+  const dpr  = window.devicePixelRatio || 1;
+  const rect = overlayCanvas.getBoundingClientRect();
+  const CW = Math.max(1, Math.round((rect.width  || gridW) * dpr));
+  const CH = Math.max(1, Math.round((rect.height || gridH) * dpr));
+  if (overlayCanvas.width !== CW || overlayCanvas.height !== CH) {
+    overlayCanvas.width  = CW;
+    overlayCanvas.height = CH;
+  }
+
   const ctx = overlayCanvas.getContext('2d');
-  const CW  = overlayCanvas.width;
-  const CH  = overlayCanvas.height;
   ctx.clearRect(0, 0, CW, CH);
+  if (!contours || contours.length === 0) return;
 
-  if (!outlinePoints || outlinePoints.length === 0) return;
+  const sx = CW / gridW;
+  const sy = CH / gridH;
 
-  const scaleX = CW / gridW;
-  const scaleY = CH / gridH;
-
-  const contours = Array.isArray(outlinePoints[0]) ? outlinePoints : [outlinePoints];
-
-  for (const contour of contours) {
-    if (!contour || contour.length < 3) continue;
-
+  const trace = (flat) => {
     ctx.beginPath();
-    const p0 = contour[0];
-    ctx.moveTo(p0.x * scaleX, p0.y * scaleY);
-    for (let i = 1; i < contour.length; i++) {
-      const p = contour[i];
-      ctx.lineTo(p.x * scaleX, p.y * scaleY);
-    }
+    ctx.moveTo(flat[0] * sx, flat[1] * sy);
+    for (let i = 2; i < flat.length - 1; i += 2) ctx.lineTo(flat[i] * sx, flat[i + 1] * sy);
     ctx.closePath();
+  };
 
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.02)';
-    ctx.fill();
+  ctx.lineJoin = 'round';
+  ctx.lineCap  = 'round';
+  ctx.setLineDash([]);
 
-    ctx.strokeStyle = 'rgba(30, 30, 30, 0.85)';
-    ctx.lineWidth   = 1.2;
-    ctx.setLineDash([]);
+  for (const flat of contours) {
+    if (!flat || flat.length < 6) continue;
+    trace(flat);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';   // thin halo keeps the edge readable on dark blue
+    ctx.lineWidth   = 3.4 * dpr;
+    ctx.stroke();
+    trace(flat);
+    ctx.strokeStyle = 'rgba(10, 10, 10, 1)';
+    ctx.lineWidth   = 1.6 * dpr;
     ctx.stroke();
   }
 }
@@ -165,7 +174,7 @@ function drawColorbar(canvas, vmax) {
  * @param {number} H
  * @returns {Uint8Array} – filtered flat array
  */
-function applyNoiseFilter(srcData, W = 256, H = 256) {
+function applyNoiseFilter(srcData, W = 256, H = 256, minNeighbors = 2) {
   const dstData = new Uint8Array(W * H);
 
   for (let r = 0; r < H; r++) {
@@ -189,7 +198,7 @@ function applyNoiseFilter(srcData, W = 256, H = 256) {
         }
       }
 
-      dstData[idx] = activeNeighbors >= 2 ? val : 0;
+      dstData[idx] = activeNeighbors >= minNeighbors ? val : 0;
     }
   }
 

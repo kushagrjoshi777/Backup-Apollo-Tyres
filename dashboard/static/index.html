@@ -11,18 +11,6 @@
 </head>
 <body>
 
-<!-- jsPDF library -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.4.0/jspdf.umd.min.js"></script>
-<script>
-  let jsPDFReady = false;
-  const checkjsPDF = setInterval(() => {
-    if (typeof jsPDF !== 'undefined') {
-      window.jsPDFLib = jsPDF;
-      jsPDFReady = true;
-      clearInterval(checkjsPDF);
-    }
-  }, 100);
-</script>
 
 <!-- ══════════════════ HEADER ══════════════════ -->
 <header class="topbar">
@@ -99,27 +87,14 @@
           </div>
         </div>
 
-        <div class="setting-group">
-          <div class="setting-label">Vehicle Speed (km/h)</div>
-          <div class="setting-row">
-            <input type="number" id="speed" min="0" max="350" step="1" value="0" class="input-control" />
-          </div>
-        </div>
 
-        <!-- FFT Noise Reduction -->
+        <!-- Detailed noise removal (same panel is available live on the dashboard) -->
         <div class="setting-group">
           <div class="setting-label">
-            FFT Noise Reduction
-            <span class="setting-hint" id="fft-hint">Keep 97% of signal</span>
+            Noise Removal Filters
+            <span class="setting-hint" id="landing-filter-hint">Fourier Butterworth low-pass</span>
           </div>
-          <div class="setting-row fft-row">
-            <span class="fft-label">Aggressive</span>
-            <input type="range" id="fft-keep" min="70" max="99" value="97" step="1" class="slider-range fft-slider" />
-            <span class="fft-label">Mild</span>
-          </div>
-          <div class="setting-row" style="justify-content:center; margin-top:4px;">
-            <span class="value-display" id="fft-val">97% preserved</span>
-          </div>
+          <div id="filter-panel-landing" class="filter-panel compact"></div>
         </div>
       </div>
 
@@ -150,12 +125,21 @@
       <span class="badge type" id="frame-rate-badge" style="background:#6a1b9a; color:#fff; display:none;"></span>
     </div>
     <div class="toolbar-right">
-      <button class="ghost-btn" id="export-btn" title="Export results">
+      <button class="ghost-btn accent" id="filter-drawer-toggle" title="Open / close the live noise-removal panel">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/>
+          <line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/>
+          <line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/>
+          <line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>
+        </svg>
+        Noise Filters
+      </button>
+      <button class="ghost-btn" id="export-btn" title="Generate the Footprint Analysis Report from the selected frame(s)">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10z"/>
           <polyline points="14 2 14 10 22 10"/>
         </svg>
-        Export PDF
+        Export Report
       </button>
       <button class="ghost-btn" id="new-file-btn" title="Upload new file">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -240,6 +224,30 @@
         <canvas id="best-canvas" width="256" height="256"></canvas>
         <canvas id="best-overlay" width="256" height="256" class="canvas-overlay"></canvas>
       </div>
+    </div>
+
+    <!-- ── PANEL R: Footprint Analysis Report (frame selection) ── -->
+    <div class="panel panel-report" id="report-panel">
+      <div class="panel-header">
+        <div>
+          <span class="panel-title">Footprint Analysis Report</span>
+          <span class="panel-tag">DYNAMIC MODEL</span>
+        </div>
+        <button class="ghost-btn accent" id="report-export-btn">Generate report</button>
+      </div>
+      <p class="report-help">
+        The report is <strong>never generated automatically</strong>. Choose the frame (or up to <strong>3 frames</strong>)
+        it is calculated from &mdash; the default is the best contact frame. Only the selected frames are used.
+      </p>
+      <div class="report-frames" id="report-chips"></div>
+      <div class="report-controls">
+        <input type="number" id="report-frame-input" min="0" class="best-frame-input" placeholder="Frame #" />
+        <button class="ghost-btn small" id="report-add-btn">Add frame</button>
+        <button class="ghost-btn small" id="report-add-current-btn">Add frame shown in animation</button>
+        <button class="ghost-btn small" id="report-reset-btn">Reset to best contact frame</button>
+        <span class="report-count" id="report-count">0 / 3 frames</span>
+      </div>
+      <div class="report-summary" id="report-summary"></div>
     </div>
 
     <!-- ── PANEL C: Metrics ── -->
@@ -352,7 +360,7 @@
           <div class="dim-unit">mm</div>
         </div>
       </div>
-      <div class="patch-note">Exact tyre outline (white) drawn on Best Contact Frame</div>
+      <div class="patch-note">Exact bounding edge (black) follows the tyre on every frame</div>
       <div class="colorbar-wrap">
         <div class="colorbar-label">Pressure Scale</div>
         <canvas id="colorbar-canvas" width="200" height="18"></canvas>
@@ -487,6 +495,18 @@
 
   </div><!-- /dash-grid -->
 </section><!-- /dashboard-page -->
+
+<!-- ══════════════════ LIVE NOISE-REMOVAL DRAWER (dashboard) ══════════════════ -->
+<aside id="filter-drawer" class="filter-drawer" aria-label="Live noise removal">
+  <div class="filter-drawer-head">
+    <div>
+      <div class="panel-title">Noise Removal Lab</div>
+      <div class="filter-drawer-sub">Changes apply live to <strong>every frame</strong></div>
+    </div>
+    <button class="ghost-btn small" id="filter-drawer-close" title="Close">&times;</button>
+  </div>
+  <div id="filter-panel-dash" class="filter-panel"></div>
+</aside>
 
 <script src="/static/heatmap.js"></script>
 <script src="/static/app.js"></script>

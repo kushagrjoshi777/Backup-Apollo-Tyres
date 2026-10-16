@@ -6,33 +6,120 @@ Handles: parsing (CSV + XSN), FFT noise reduction, 13 metrics, heatmap serialisa
 import sys
 import os
 import re
+import base64
 import numpy as np
 from scipy.fft import fft2, ifft2, fftshift, ifftshift
 from scipy.ndimage import median_filter
 import cv2
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+
+# All selectable noise-removal engines (key → label); mirrored in the UI.
+FILTER_TYPES = (
+    "none",
+    "gaussian",
+    "median",
+    "bilateral",
+    "fft_butterworth_lp",
+    "fft_gaussian_lp",
+    "fft_ideal_lp",
+    "fft_notch",
+)
+
 
 @dataclass
 class PipelineConfig:
     tyre_type: str = "TBR"
     pressure_ceiling: float = 220.0
-    min_pressure: float = 5.0
-    fft_enabled: bool = True
-    fft_cutoff: float = 0.97
-    fft_filter_strength: int = 2
+    min_pressure: float = 5.0            # noise floor (PSI)
+    # ── main noise-removal engine ──
+    filter_type: str = "fft_butterworth_lp"
+    fft_enabled: bool = True             # legacy flag (derived from filter_type)
+    fft_cutoff: float = 0.80             # fraction of Nyquist retained (Fourier filters)
+    fft_filter_strength: int = 2         # Butterworth order
+    gaussian_sigma: float = 1.0          # spatial Gaussian sigma (sensels)
+    median_size: int = 3                 # spatial median kernel (odd)
+    bilateral_sigma_color: float = 25.0  # PSI
+    bilateral_sigma_space: float = 2.0   # sensels
+    notch_sensitivity: float = 6.0       # spectral peak / background ratio
+    # ── despeckle stages ──
     temporal_filter_enabled: bool = True
     temporal_spike_threshold: float = 3.0
-    spatial_filter_enabled: bool = True  
+    spatial_filter_enabled: bool = True
     spatial_mad_threshold: float = 4.0
+    # ── clean-up stages ──
     patch_filter_enabled: bool = True
     sensel_area_mm2: float = 2.434
     min_patch_area_mm2: float = 12.0
     patch_preserve_threshold_psi: float = 20.0
+    morph_open: int = 0                  # binary opening kernel (0 = off)
+    morph_close: int = 0                 # grey closing kernel (0 = off)
+    keep_largest_only: bool = False
+    min_component_px: int = 12
+    # ── misc ──
     lineout_detection_enabled: bool = False
     lineout_threshold_pct: float = 50.0
     baseline_frame_index: int | None = None
+    rotation_k: int = 1                  # 90° CCW turns applied for display (1 → rolls bottom→top)
 
+
+# (type, min, max) — user supplied filter overrides are coerced + clamped here.
+_CONFIG_SPEC = {
+    "filter_type":                   (str,   None, None),
+    "fft_cutoff":                    (float, 0.05, 1.0),
+    "fft_filter_strength":           (int,   1,    8),
+    "gaussian_sigma":                (float, 0.2,  6.0),
+    "median_size":                   (int,   3,    9),
+    "bilateral_sigma_color":         (float, 2.0,  120.0),
+    "bilateral_sigma_space":         (float, 0.5,  8.0),
+    "notch_sensitivity":             (float, 2.0,  20.0),
+    "temporal_filter_enabled":       (bool,  None, None),
+    "temporal_spike_threshold":      (float, 1.0,  8.0),
+    "spatial_filter_enabled":        (bool,  None, None),
+    "spatial_mad_threshold":         (float, 1.5,  10.0),
+    "patch_filter_enabled":          (bool,  None, None),
+    "min_patch_area_mm2":            (float, 0.0,  200.0),
+    "patch_preserve_threshold_psi":  (float, 5.0,  200.0),
+    "morph_open":                    (int,   0,    7),
+    "morph_close":                   (int,   0,    7),
+    "keep_largest_only":             (bool,  None, None),
+    "min_component_px":              (int,   1,    200),
+    "min_pressure":                  (float, 0.0,  100.0),
+    "rotation_k":                    (int,   0,    3),
+}
+
+
+def config_with_overrides(base: "PipelineConfig", overrides: dict | None) -> "PipelineConfig":
+    """Return a copy of ``base`` with validated user filter overrides applied."""
+    cfg = PipelineConfig(**{k: v for k, v in base.__dict__.items()})
+    for key, val in (overrides or {}).items():
+        spec = _CONFIG_SPEC.get(key)
+        if spec is None or val is None:
+            continue
+        typ, lo, hi = spec
+        try:
+            if typ is bool:
+                val = val if isinstance(val, bool) else str(val).lower() in ("1", "true", "yes", "on")
+            elif typ is int:
+                val = int(round(float(val)))
+            elif typ is float:
+                val = float(val)
+            else:
+                val = str(val)
+        except (TypeError, ValueError):
+            continue
+        if lo is not None:
+            val = max(lo, val)
+        if hi is not None:
+            val = min(hi, val)
+        if key == "filter_type" and val not in FILTER_TYPES:
+            continue
+        if key == "median_size" and val % 2 == 0:
+            val += 1
+        setattr(cfg, key, val)
+    cfg.fft_enabled = cfg.filter_type.startswith("fft_")
+    return cfg
 # Allow importing from parent src/ directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.parser import parse_file_extended
@@ -117,44 +204,117 @@ def extract_metadata_from_file(filepath: str) -> dict:
 
 
 
-def apply_fft_butterworth(
+def _radial_freq(shape: tuple) -> np.ndarray:
+    """Normalised radial spatial frequency (0 = DC, 1.0 = Nyquist along an axis)."""
+    fy = np.fft.fftfreq(shape[0])[:, None]
+    fx = np.fft.fftfreq(shape[1])[None, :]
+    return np.sqrt(fx ** 2 + fy ** 2) / 0.5
+
+
+def _fourier_transfer(shape: tuple, spectrum_mag: np.ndarray | None, config: PipelineConfig) -> np.ndarray:
+    """Build the (un-shifted) Fourier-domain transfer function H for the active filter."""
+    r = _radial_freq(shape)
+    c = max(config.fft_cutoff, 0.02)
+    kind = config.filter_type
+
+    if kind == "fft_butterworth_lp":
+        return 1.0 / (1.0 + (r / c) ** (2 * max(1, config.fft_filter_strength)))
+    if kind == "fft_gaussian_lp":
+        return np.exp(-(r ** 2) / (2.0 * c ** 2))
+    if kind == "fft_ideal_lp":
+        return (r <= c).astype(np.float64)
+    if kind == "fft_notch" and spectrum_mag is not None:
+        mags = fftshift(spectrum_mag)
+        bg = np.maximum(median_filter(mags, size=9), 1e-6)
+        peaks = (mags > config.notch_sensitivity * bg) & (fftshift(r) > 0.10)
+        blob = cv2.dilate(peaks.astype(np.float32), np.ones((3, 3), np.uint8))
+        blob = cv2.GaussianBlur(blob, (0, 0), 1.0)
+        return ifftshift(1.0 - np.clip(blob * 2.0, 0.0, 1.0))
+    return np.ones(shape, dtype=np.float64)
+
+
+def apply_noise_filter(
     frame_psi: np.ndarray,
     config: PipelineConfig,
 ) -> tuple[np.ndarray, np.ndarray, int, float]:
     """
-    XSENSOR-inspired Fourier noise reduction.
+    Main noise-removal engine. Supports spatial (Gaussian / median / bilateral) and
+    Fourier-domain (Butterworth / Gaussian / ideal low-pass, spectral notch) filters.
+    Returns (filtered, removed_noise, n_spikes_repaired, energy_removed).
     """
-    if not config.fft_enabled:
-        return frame_psi.copy(), np.zeros_like(frame_psi), 0, 0.0
-        
-    med = median_filter(frame_psi, size=3)
-    diff = np.abs(frame_psi - med)
-    spike_mask = diff > (20.0 + 0.3 * med)
-    spike_mask &= (frame_psi > config.min_pressure)
-    n_spikes = int(np.sum(spike_mask))
-    
-    clean_frame = frame_psi.copy()
-    clean_frame[spike_mask] = med[spike_mask]
+    kind = config.filter_type
+    src = frame_psi.astype(np.float32)
+    n_spikes = 0
 
-    rows, cols = clean_frame.shape
-    f_shift = fftshift(fft2(clean_frame.astype(np.float64)))
-    cy, cx = rows // 2, cols // 2
-    y, x = np.ogrid[-cy : rows - cy, -cx : cols - cx]
-    d = np.sqrt(x**2 + y**2)
+    if kind == "none":
+        filtered = src.copy()
+    elif kind in ("gaussian", "median", "bilateral"):
+        if kind == "gaussian":
+            filtered = cv2.GaussianBlur(src, (0, 0), float(config.gaussian_sigma))
+        elif kind == "median":
+            filtered = median_filter(src, size=int(config.median_size))
+        else:
+            filtered = cv2.bilateralFilter(
+                src, d=0,
+                sigmaColor=float(config.bilateral_sigma_color),
+                sigmaSpace=float(config.bilateral_sigma_space),
+            )
+        src = src
+    else:
+        # Fourier path — first repair hard single-sensel spikes so they do not ring.
+        med = median_filter(src, size=3)
+        diff = np.abs(src - med)
+        spike_mask = (diff > (20.0 + 0.3 * med)) & (src > config.min_pressure)
+        n_spikes = int(np.sum(spike_mask))
+        src = src.copy()
+        src[spike_mask] = med[spike_mask]
 
-    f_nyquist = min(rows, cols) / 2.0
-    d0 = max(10.0, min(f_nyquist * 0.9, config.fft_cutoff * f_nyquist * 0.85))
-    h_butterworth = 1.0 / (1.0 + (d / max(1.0, d0)) ** (2 * config.fft_filter_strength))
+        pad = int(max(0, min(16, min(src.shape) - 1)))
+        padded = np.pad(src.astype(np.float64), pad, mode="reflect") if pad else src.astype(np.float64)
+        spectrum = fft2(padded)
+        h = _fourier_transfer(padded.shape, np.abs(spectrum), config)
+        out = np.real(ifft2(spectrum * h))
+        if pad:
+            out = out[pad:-pad, pad:-pad]
+        filtered = out.astype(np.float32)
 
-    filtered = np.real(ifft2(ifftshift(f_shift * h_butterworth)))
     filtered = np.clip(filtered, 0.0, None)
-
     filtered[filtered < config.min_pressure] = 0.0
 
-    noise = clean_frame - filtered
+    noise = src - filtered
     energy_removed = float(np.sum(np.abs(noise)))
-    
     return filtered.astype(np.float32), noise.astype(np.float32), n_spikes, energy_removed
+
+
+def apply_fft_butterworth(frame_psi, config):
+    """Backward-compatible alias — forwards to the multi-engine noise filter."""
+    return apply_noise_filter(frame_psi, config)
+
+
+def morphological_cleanup(frame: np.ndarray, config: PipelineConfig) -> np.ndarray:
+    """Optional binary opening (speck removal) and grey closing (gap bridging)."""
+    out = frame
+    if config.morph_open and config.morph_open >= 2:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (config.morph_open, config.morph_open))
+        mask = (out > 0).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+        out = np.where(mask > 0, out, 0.0).astype(np.float32)
+    if config.morph_close and config.morph_close >= 2:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (config.morph_close, config.morph_close))
+        out = cv2.morphologyEx(out.astype(np.float32), cv2.MORPH_CLOSE, k)
+    return out
+
+
+def keep_largest_component(frame: np.ndarray, threshold: float) -> np.ndarray:
+    """Zero everything except the single largest connected contact region."""
+    binary = (frame >= threshold).astype(np.uint8)
+    if not np.any(binary):
+        return frame
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if n <= 2:
+        return frame
+    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return np.where(labels == biggest, frame, 0.0).astype(np.float32)
 
 
 def zero_pressure_baseline(frames: dict[int, np.ndarray], config: PipelineConfig) -> tuple[np.ndarray | None, dict]:
@@ -351,21 +511,18 @@ def _xsn_temporal_average(
     return np.mean(candidates, axis=0).astype(np.float32)
 
 
-def load_and_process(
+def prepare_job(
     filepath: str,
     tyre_type: str = "TBR",
     min_pressure: float = 5.0,
     max_pressure: float = 220.0,
     speed: float = 0.0,
     position: str = "FR",
-    fft_keep_ratio: float = 0.97,
 ) -> dict:
     """
-    Full pipeline: parse (CSV or XSN) → calibrate → baseline → saturation handling → 
-    temporal filter → spatial filter → FFT → patch filter → metrics → serialise.
+    Parse + calibrate + baseline-subtract + trim once. The returned context is cached so
+    the (cheap) filter pipeline can be re-run live with different noise settings.
     """
-    vmax_psi = max_pressure
-
     meta = extract_metadata_from_file(filepath)
     if speed == 0.0 and meta["speed"] > 0:
         speed = meta["speed"]
@@ -375,151 +532,208 @@ def load_and_process(
 
     sensel_w = meta.get("sensel_width_mm", DEFAULT_SENSEL_MM)
     sensel_h = meta.get("sensel_height_mm", DEFAULT_SENSEL_MM)
-    sensel_area_mm2 = sensel_w * sensel_h
-
     is_xsn = meta["is_xsn"]
-    
-    config = PipelineConfig(
+
+    base_config = PipelineConfig(
         tyre_type=tyre_type.upper(),
         pressure_ceiling=max_pressure,
         min_pressure=min_pressure,
-        fft_enabled=True,
-        fft_cutoff=fft_keep_ratio,
-        sensel_area_mm2=sensel_area_mm2,
+        sensel_area_mm2=sensel_w * sensel_h,
     )
 
-    parsed = parse_file_extended(filepath, max_frames=MAX_XSN_FRAMES, tyre_type=config.tyre_type, pressure_ceiling=config.pressure_ceiling)
+    parsed = parse_file_extended(
+        filepath, max_frames=MAX_XSN_FRAMES,
+        tyre_type=base_config.tyre_type, pressure_ceiling=base_config.pressure_ceiling,
+    )
     calibrated_frames = parsed["frames"]
     raw_frames = parsed.get("raw_frames", {})
     calibration_results = parsed.get("calibration_results", {})
-    xsn_frame_rate = parsed.get("frame_rate")
-    is_provisional = parsed.get("is_provisional", False)
-    total_frames = parsed.get("total_frames", len(calibrated_frames))
-    raw_diagnostics = parsed.get("raw_diagnostics", {})
 
     if not calibrated_frames:
         raise ValueError("No frames found in the file.")
 
     # 1. Zero-pressure baseline
-    baseline_frame, baseline_diag = zero_pressure_baseline(calibrated_frames, config)
+    baseline_frame, baseline_diag = zero_pressure_baseline(calibrated_frames, base_config)
     if baseline_frame is not None:
         for k in calibrated_frames:
             calibrated_frames[k] = np.maximum(calibrated_frames[k] - baseline_frame, 0.0)
 
-    # 2. Select valid frames & 50-frame playback window
-    trimmed = _trim_frames(calibrated_frames, config.pressure_ceiling, min_pressure)
+    # 2. Playback window
+    trimmed = _trim_frames(calibrated_frames, base_config.pressure_ceiling, min_pressure)
     if not trimmed:
         trimmed = calibrated_frames
-
     frame_numbers = sorted(trimmed.keys())
-    
-    # 3. Temporal Anti-speckle (only on playback window)
-    playback_frames = {fn: trimmed[fn] for fn in frame_numbers}
-    temporal_filtered, temporal_diag = temporal_antispeckle(playback_frames, config)
 
-    # Pipeline processing and diagnostics
-    filtered_frames = {}
-    pixel_data_store = {}
-    frame_diagnostics = []
-    
-    total_repaired_spikes = temporal_diag.get("temporal_spikes_repaired", 0)
-    total_invalid = 0
-    total_saturated = 0
+    return {
+        "base_config": base_config,
+        "trimmed": {fn: np.asarray(trimmed[fn], dtype=np.float32) for fn in frame_numbers},
+        "frame_numbers": frame_numbers,
+        "raw": {fn: raw_frames[fn] for fn in frame_numbers if fn in raw_frames},
+        "calib": {fn: calibration_results[fn] for fn in frame_numbers if fn in calibration_results},
+        "baseline_diag": baseline_diag,
+        "sensel_w": sensel_w,
+        "sensel_h": sensel_h,
+        "is_xsn": is_xsn,
+        "speed": speed,
+        "position": position,
+        "vmax_psi": max_pressure,
+        "calibration_method": parsed.get("calibration_method", "UNKNOWN"),
+        "calibration_confidence": parsed.get("calibration_confidence", "UNKNOWN"),
+        "frame_rate": parsed.get("frame_rate"),
+        "is_provisional": parsed.get("is_provisional", False),
+        "total_frames": parsed.get("total_frames", len(calibrated_frames)),
+    }
 
-    for fn in frame_numbers:
+
+def _outline_contours(mask: np.ndarray, up: int = 4, eps: float = 0.25) -> list:
+    """
+    Sub-sensel accurate, densely sampled outer boundary of a contact mask.
+    The mask is upsampled ``up``× before contour tracing so the polygon follows the real
+    edge with many vertices (not a coarse 1-sensel staircase). Coordinates are returned
+    as flat [x0, y0, x1, y1, …] lists in sensel units (pixel i spans [i, i+1]).
+    """
+    if mask is None or not np.any(mask):
+        return []
+    m = np.pad(mask.astype(np.float32), 1)
+    big = cv2.resize(m, None, fx=up, fy=up, interpolation=cv2.INTER_LINEAR)
+    binary = (big >= 0.5).astype(np.uint8)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    out = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) < 3 * up * up:
+            continue
+        approx = cv2.approxPolyDP(cnt, eps, True) if eps > 0 else cnt
+        pts = approx.reshape(-1, 2).astype(np.float32)
+        if len(pts) < 3:
+            continue
+        pts = (pts + 0.5) / up - 1.0
+        out.append(np.round(pts, 2).flatten().tolist())
+    return out
+
+
+def _rot(arr: np.ndarray, k: int) -> np.ndarray:
+    return np.ascontiguousarray(np.rot90(arr, k % 4))
+
+
+def _b64_u8(arr_u8: np.ndarray) -> str:
+    return base64.b64encode(np.ascontiguousarray(arr_u8, dtype=np.uint8).tobytes()).decode("ascii")
+
+
+def run_pipeline(ctx: dict, config: PipelineConfig) -> dict:
+    """
+    Run the whole filter chain for every playback frame with the given config.
+    temporal → spatial MAD despike → main noise engine → patch filter → morphology →
+    segmentation → metrics + exact outlines. All frames are recomputed so every frame
+    (animation, best-frame view, report) reflects the same live filter settings.
+    """
+    vmax_psi = ctx["vmax_psi"]
+    sensel_w, sensel_h = ctx["sensel_w"], ctx["sensel_h"]
+    position = ctx["position"]
+    is_xsn = ctx["is_xsn"]
+    raw_frames = ctx["raw"]
+    calibration_results = ctx["calib"]
+    frame_numbers = ctx["frame_numbers"]
+    min_pressure = config.min_pressure
+    sensel_area_mm2 = sensel_w * sensel_h
+    config.sensel_area_mm2 = sensel_area_mm2
+
+    temporal_filtered, temporal_diag = temporal_antispeckle(ctx["trimmed"], config)
+
+    def work(fn: int) -> dict:
         arr = temporal_filtered[fn]
-        
-        # Diagnostics base
+
         raw_min = raw_max = raw_mean = 0.0
         invalid_count = saturation_count = 0
-        
-        if is_xsn and fn in raw_frames:
-            raw_matrix = raw_frames[fn]
-            flat_raw = raw_matrix.flatten()
-            nonzero_raw = flat_raw[flat_raw > 0]
-            raw_min = float(np.min(nonzero_raw)) if len(nonzero_raw) > 0 else 0.0
+        if is_xsn and fn in raw_frames and fn in calibration_results:
+            flat_raw = raw_frames[fn].flatten()
+            nz = flat_raw[flat_raw > 0]
+            raw_min = float(np.min(nz)) if len(nz) else 0.0
             raw_max = float(np.max(flat_raw))
-            raw_mean = float(np.mean(nonzero_raw)) if len(nonzero_raw) > 0 else 0.0
-            
-            calib_res = calibration_results[fn]
-            invalid_count = int(np.sum(calib_res.invalid_mask))
-            saturation_count = int(np.sum(calib_res.saturation_mask))
-            total_invalid += invalid_count
-            total_saturated += saturation_count
-            
+            raw_mean = float(np.mean(nz)) if len(nz) else 0.0
+            invalid_count = int(np.sum(calibration_results[fn].invalid_mask))
+            saturation_count = int(np.sum(calibration_results[fn].saturation_mask))
+
         flat_cal = arr.flatten()
-        active_cal = flat_cal[flat_cal > config.min_pressure]
-        cal_min = float(np.min(active_cal)) if len(active_cal) > 0 else 0.0
+        active_cal = flat_cal[flat_cal > min_pressure]
+        cal_min = float(np.min(active_cal)) if len(active_cal) else 0.0
         cal_max = float(np.max(flat_cal))
-        cal_mean = float(np.mean(active_cal)) if len(active_cal) > 0 else 0.0
+        cal_mean = float(np.mean(active_cal)) if len(active_cal) else 0.0
         cal_p95 = float(np.percentile(flat_cal, 95))
         cal_p98 = float(np.percentile(flat_cal, 98))
-        
-        # 4. Spatial Filter
-        spatial_filtered, n_spatial_spikes = spatial_spike_filter(arr, config)
-        total_repaired_spikes += n_spatial_spikes
-        
-        # 5. FFT
-        fft_filtered, noise, n_fft_spikes, energy_removed = apply_fft_butterworth(spatial_filtered, config)
-        
-        # 6. Patch filter
-        patch_filtered, patch_diag = sensel_patch_filter(fft_filtered, config)
-        
-        # 7. Contact segmentation
-        mask = _segment_contact(patch_filtered, min_pressure)
-        segmented = np.where(mask, patch_filtered, 0.0).astype(np.float32)
-        
-        filtered_frames[fn] = segmented
-        
-        # Store for pixel inspector (just the required fields, we will extract for best frame later)
-        pixel_data_store[fn] = {
-            "spatial_filtered": spatial_filtered,
-            "segmented": segmented,
-            "spatial_spikes": n_spatial_spikes,
-        }
-        
-        # Diagnostics
-        active_sensels = int(np.sum(segmented > config.min_pressure))
-        frame_diagnostics.append({
+
+        spatial_filtered, n_spatial = spatial_spike_filter(arr, config)
+        filtered, noise, n_fft, energy_removed = apply_noise_filter(spatial_filtered, config)
+        patched, _patch_diag = sensel_patch_filter(filtered, config)
+        patched = morphological_cleanup(patched, config)
+        mask = _segment_contact(patched, min_pressure, config.min_component_px)
+        segmented = np.where(mask, patched, 0.0).astype(np.float32)
+        if config.keep_largest_only:
+            segmented = keep_largest_component(segmented, min_pressure)
+
+        metrics = _frame_metrics_13(segmented, fn, min_pressure, position, sensel_w, sensel_h, vmax_psi)
+        seg_mask = segmented > min_pressure
+        if np.any(seg_mask):
+            rows_any = np.any(seg_mask, axis=1)
+            cols_any = np.any(seg_mask, axis=0)
+            r0, r1 = int(np.argmax(rows_any)), int(len(rows_any) - 1 - np.argmax(rows_any[::-1]))
+            c0, c1 = int(np.argmax(cols_any)), int(len(cols_any) - 1 - np.argmax(cols_any[::-1]))
+            metrics["bbox_width_mm"] = round((c1 - c0 + 1) * sensel_w, 1)
+            metrics["bbox_length_mm"] = round((r1 - r0 + 1) * sensel_h, 1)
+        else:
+            metrics["bbox_width_mm"] = metrics["bbox_length_mm"] = 0.0
+
+        disp = _rot(segmented, config.rotation_k)
+        clipped = np.clip(disp, 0, vmax_psi)
+        u8 = (clipped / vmax_psi * 255).astype(np.uint8)
+        outline = _outline_contours(disp > min_pressure)
+
+        active_sensels = int(np.sum(seg_mask))
+        diag = {
             "frame_index": fn,
             "raw_min": raw_min, "raw_max": raw_max, "raw_mean": raw_mean,
             "calibrated_min": cal_min, "calibrated_max": cal_max, "calibrated_mean": cal_mean,
             "calibrated_p95": cal_p95, "calibrated_p98": cal_p98,
-            "active_sensels": active_sensels, 
+            "active_sensels": active_sensels,
             "contact_area_mm2": active_sensels * sensel_area_mm2,
             "total_load_n": float(np.sum(segmented) * 0.00689476 * sensel_area_mm2),
-            "invalid_count": invalid_count, 
+            "invalid_count": invalid_count,
             "saturation_count": saturation_count,
-            "spatial_spike_count": n_spatial_spikes, 
+            "spatial_spike_count": n_spatial,
             "temporal_spike_count": temporal_diag.get("temporal_spikes_detected", 0) if fn == frame_numbers[0] else 0,
-        })
+            "noise_removed_psi_sum": round(energy_removed, 1),
+        }
+        return {
+            "fn": fn, "segmented": segmented, "spatial_filtered": spatial_filtered,
+            "u8": u8, "outline": outline, "metrics": metrics, "diag": diag,
+            "n_spatial": n_spatial,
+        }
 
-    # Metrics
-    metrics_list = [
-        _frame_metrics_13(
-            filtered_frames[fn], fn, min_pressure, position, sensel_w, sensel_h, vmax_psi
-        )
-        for fn in frame_numbers
-    ]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(work, frame_numbers))
+    by_fn = {r["fn"]: r for r in results}
 
-    best_idx  = int(np.argmax([m["active_sensels"] for m in metrics_list]))
-    best_fn   = frame_numbers[best_idx]
-    best_arr  = filtered_frames[best_fn]
+    metrics_list = [by_fn[fn]["metrics"] for fn in frame_numbers]
+    frame_diagnostics = [by_fn[fn]["diag"] for fn in frame_numbers]
+    total_repaired_spikes = temporal_diag.get("temporal_spikes_repaired", 0) + sum(r["n_spatial"] for r in results)
 
-    patch = _contact_patch_exact(best_arr, min_pressure, sensel_w, sensel_h)
+    best_idx = int(np.argmax([m["active_sensels"] for m in metrics_list]))
+    best_fn = frame_numbers[best_idx]
+    best_seg = by_fn[best_fn]["segmented"]
+    patch = _contact_patch_exact(best_seg, min_pressure, sensel_w, sensel_h)
+    patch.pop("outline_points", None)
 
-    frames_data = {
-        str(fn): _serialise_frame(filtered_frames[fn], vmax_psi)
-        for fn in frame_numbers
-    }
-    
-    # Build calibration audit
+    total_invalid = sum(d["invalid_count"] for d in frame_diagnostics)
+    total_saturated = sum(d["saturation_count"] for d in frame_diagnostics)
+
+    disp_shape = by_fn[best_fn]["u8"].shape
+    grid_rows, grid_cols = int(disp_shape[0]), int(disp_shape[1])
+
     calib_audit = {
         "sensor": "XSENSOR HX510" if is_xsn else "Unknown CSV",
         "vehicle_type": config.tyre_type,
         "pressure_range": f"0-{config.pressure_ceiling} PSI",
         "calibration_source": "Empirical cross-validation with CSV" if is_xsn else "CSV",
-        "calibration_method": parsed.get("calibration_method", "UNKNOWN"),
+        "calibration_method": ctx["calibration_method"],
         "raw_domain": "uint16 [0, 65535]" if is_xsn else "N/A",
         "psi_domain": "float32 [0, 511.99]",
         "offset": 0.0,
@@ -527,54 +741,64 @@ def load_and_process(
         "saturated_values": total_saturated,
         "invalid_values": total_invalid,
         "repaired_spikes": total_repaired_spikes,
-        "baseline_frame": baseline_diag.get("baseline_frame_index"),
-        "calibration_confidence": parsed.get("calibration_confidence", "UNKNOWN"),
+        "baseline_frame": ctx["baseline_diag"].get("baseline_frame_index"),
+        "calibration_confidence": ctx["calibration_confidence"],
     }
-    
-    # Build Pixel data for best frame
-    best_pixel_data = {
-        "grid_rows": 256,
-        "grid_cols": 256,
+
+    # ── Pixel inspector payload for the best frame (display orientation) ──
+    k = config.rotation_k
+    pd = {
+        "grid_rows": grid_rows, "grid_cols": grid_cols,
         "calibration_method": calib_audit["calibration_method"],
         "pressure_range": config.tyre_type,
         "pressure_ceiling": config.pressure_ceiling,
         "calibration_confidence": calib_audit["calibration_confidence"],
+        # every array below is a base64 little-endian typed buffer (dtype in "_dtypes")
+        "encoding": "b64",
+        "_dtypes": {},
     }
-    
-    if is_xsn and best_fn in raw_frames and best_fn in calibration_results:
-        best_pixel_data["best_frame_raw"] = raw_frames[best_fn].flatten().tolist()
-        calib_res = calibration_results[best_fn]
-        best_pixel_data["best_frame_calibrated"] = calib_res.calibrated_psi.flatten().tolist()
-        best_pixel_data["invalid_mask"] = calib_res.invalid_mask.flatten().tolist()
-        best_pixel_data["saturation_mask"] = calib_res.saturation_mask.flatten().tolist()
-    else:
-        best_pixel_data["best_frame_raw"] = []
-        best_pixel_data["best_frame_calibrated"] = calibrated_frames[best_fn].flatten().tolist() if best_fn in calibrated_frames else []
-        best_pixel_data["invalid_mask"] = []
-        best_pixel_data["saturation_mask"] = []
-        
-    if best_fn in pixel_data_store:
-        pds = pixel_data_store[best_fn]
-        best_pixel_data["best_frame_filtered"] = pds["spatial_filtered"].flatten().tolist()
-        best_pixel_data["best_frame_final"] = pds["segmented"].flatten().tolist()
-        best_pixel_data["contact_mask"] = (pds["segmented"] > min_pressure).flatten().tolist()
-        
-        # Approximate spike mask
-        if best_fn in calibrated_frames:
-            orig = calibrated_frames[best_fn]
-            diff = np.abs(orig - pds["spatial_filtered"])
-            best_pixel_data["spike_mask"] = (diff > 0.1).flatten().tolist()
-        else:
-            best_pixel_data["spike_mask"] = []
-    else:
-        best_pixel_data["best_frame_filtered"] = []
-        best_pixel_data["best_frame_final"] = []
-        best_pixel_data["contact_mask"] = []
-        best_pixel_data["spike_mask"] = []
 
+    def _put(name, a, dtype):
+        dt = np.dtype(dtype)
+        buf = np.ascontiguousarray(_rot(np.asarray(a), k)).astype(dt).tobytes()
+        pd[name] = base64.b64encode(buf).decode("ascii")
+        pd["_dtypes"][name] = dt.str
+
+    def _empty(name):
+        pd[name] = ""
+        pd["_dtypes"][name] = "<f4"
+
+    if is_xsn and best_fn in raw_frames and best_fn in calibration_results:
+        cres = calibration_results[best_fn]
+        _put("best_frame_raw", raw_frames[best_fn], "<u2")
+        _put("best_frame_calibrated", cres.calibrated_psi, "<f4")
+        _put("invalid_mask", cres.invalid_mask, "u1")
+        _put("saturation_mask", cres.saturation_mask, "u1")
+    else:
+        _empty("best_frame_raw")
+        if best_fn in ctx["trimmed"]:
+            _put("best_frame_calibrated", ctx["trimmed"][best_fn], "<f4")
+        else:
+            _empty("best_frame_calibrated")
+        _empty("invalid_mask")
+        _empty("saturation_mask")
+    _put("best_frame_filtered", by_fn[best_fn]["spatial_filtered"], "<f4")
+    _put("best_frame_final", best_seg, "<f4")
+    _put("contact_mask", best_seg > min_pressure, "u1")
+    if best_fn in ctx["trimmed"]:
+        diff = np.abs(ctx["trimmed"][best_fn] - by_fn[best_fn]["spatial_filtered"])
+        _put("spike_mask", diff > 0.1, "u1")
+    else:
+        _empty("spike_mask")
+
+    cfg_dict = dict(config.__dict__)
     return {
         "frame_numbers":     frame_numbers,
-        "frames":            frames_data,
+        "frames":            {str(fn): _b64_u8(by_fn[fn]["u8"]) for fn in frame_numbers},
+        "frames_encoding":   "b64-u8",
+        "outlines":          {str(fn): by_fn[fn]["outline"] for fn in frame_numbers},
+        "grid_rows":         grid_rows,
+        "grid_cols":         grid_cols,
         "metrics":           metrics_list,
         "best_frame_index":  best_idx,
         "best_frame_number": best_fn,
@@ -582,22 +806,37 @@ def load_and_process(
         "contact_patch":     patch,
         "vmax":              vmax_psi,
         "vmin":              min_pressure,
-        "speed":             speed,
+        "speed":             ctx["speed"],
         "position":          position,
         "tyre_type":         config.tyre_type,
-        "fft_keep_ratio":    fft_keep_ratio,
+        "filter_type":       config.filter_type,
         "sensel_w_mm":       sensel_w,
         "sensel_h_mm":       sensel_h,
         "is_xsn":            is_xsn,
-        "is_provisional":    is_provisional,
-        "frame_rate":        xsn_frame_rate,
-        "total_frames_in_file": total_frames,
+        "is_provisional":    ctx["is_provisional"],
+        "frame_rate":        ctx["frame_rate"],
+        "total_frames_in_file": ctx["total_frames"],
         "calibration_audit": calib_audit,
         "frame_diagnostics": frame_diagnostics,
-        "baseline_diagnostics": baseline_diag,
-        "pipeline_config": config.__dict__,
-        "pixel_data": best_pixel_data,
+        "baseline_diagnostics": ctx["baseline_diag"],
+        "pipeline_config":   cfg_dict,
+        "pixel_data":        pd,
     }
+
+
+def load_and_process(
+    filepath: str,
+    tyre_type: str = "TBR",
+    min_pressure: float = 5.0,
+    max_pressure: float = 220.0,
+    speed: float = 0.0,
+    position: str = "FR",
+    filters: dict | None = None,
+) -> dict:
+    """One-shot convenience wrapper: prepare the job then run the filter pipeline."""
+    ctx = prepare_job(filepath, tyre_type, min_pressure, max_pressure, speed, position)
+    cfg = config_with_overrides(ctx["base_config"], filters)
+    return run_pipeline(ctx, cfg)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -896,16 +1135,14 @@ def _contact_patch_exact(
         points = []
         for pt in approx:
             c, r = int(pt[0][0]), int(pt[0][1])
-            # canvas y = H - 1 - r (due to np.flipud in _serialise_frame)
-            points.append({"x": c, "y": H - 1 - r})
+            # No y-inversion needed — frame data is no longer flipud'd
+            points.append({"x": c, "y": r})
         if len(points) >= 3:
             outline_contours.append(points)
 
     outline_points = outline_contours[0] if len(outline_contours) == 1 else outline_contours
 
-    orig_r0 = H - 1 - row_max
-    orig_r1 = H - 1 - row_min
-    bbox = [col_min, orig_r0, col_max, orig_r1]
+    bbox = [col_min, row_min, col_max, row_max]
 
     return {
         "width_mm":  width_mm,
@@ -918,10 +1155,10 @@ def _contact_patch_exact(
 def _serialise_frame(arr: np.ndarray, vmax_psi: float) -> list:
     """Return a flat list of uint8 values (0-255) for canvas rendering.
 
-    Normalised against vmax_psi.  Origin=lower → flip vertically so row 0
-    is at top in canvas.  Correctly maps PSI → jet LUT index.
+    Normalised against vmax_psi.  No vertical flip — preserves original
+    sensor orientation so outer tread is at bottom, inner at top,
+    matching XSENSOR Desktop display convention.
     """
     clipped    = np.clip(arr, 0, vmax_psi)
     normalised = (clipped / vmax_psi * 255).astype(np.uint8)
-    flipped    = np.flipud(normalised)
-    return flipped.flatten().tolist()
+    return normalised.flatten().tolist()

@@ -26,7 +26,7 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-from processor import load_and_process
+from processor import prepare_job, run_pipeline, config_with_overrides
 from pdf_export import generate_report_pdf
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -52,6 +52,9 @@ app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024   # 2 GB
 # ── In-memory job store ───────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}    # job_id → {"status", "result"|"error"}
 _jobs_lock = threading.Lock()
+_job_ctx: dict[str, dict] = {}       # job_id → cached pre-filter context (for live refilter)
+_job_run_locks: dict[str, threading.Lock] = {}
+_job_latest_seq: dict[str, int] = {}
 
 ALLOWED_EXTS = {".csv", ".xsn"}
 
@@ -94,10 +97,11 @@ def upload():
         speed = 0.0
 
     try:
-        fft_keep_ratio = float(request.form.get("fft_keep_ratio", 0.97))
-        fft_keep_ratio = max(0.50, min(1.0, fft_keep_ratio))   # clamp [0.5, 1.0]
+        filters = json.loads(request.form.get("filters", "{}") or "{}")
+        if not isinstance(filters, dict):
+            filters = {}
     except ValueError:
-        fft_keep_ratio = 0.97
+        filters = {}
 
     position = request.form.get("position", "FR").upper()
 
@@ -114,7 +118,7 @@ def upload():
         args=(
             job_id, save_path, tyre_type,
             min_pressure, max_pressure,
-            speed, position, filename, fft_keep_ratio
+            speed, position, filename, filters
         ),
         daemon=True
     )
@@ -150,9 +154,42 @@ def result(job_id):
     return jsonify(job["result"])
 
 
+@app.route("/refilter/<job_id>", methods=["POST"])
+def refilter(job_id):
+    """Live noise-removal: re-run the filter pipeline on every frame with new settings."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        ctx = _job_ctx.get(job_id)
+        run_lock = _job_run_locks.setdefault(job_id, threading.Lock())
+
+    if job is None or job.get("status") != "done" or ctx is None:
+        return jsonify({"error": "Job not found or not ready"}), 404
+
+    data = request.get_json() or {}
+    filters = data.get("filters") or {}
+    seq = int(data.get("seq", 0))
+    with _jobs_lock:
+        _job_latest_seq[job_id] = max(seq, _job_latest_seq.get(job_id, 0))
+
+    with run_lock:
+        # A newer request already superseded this one while it waited – skip the work.
+        if seq < _job_latest_seq.get(job_id, 0):
+            return jsonify({"stale": True, "seq": seq})
+        try:
+            cfg = config_with_overrides(ctx["base_config"], filters)
+            result = run_pipeline(ctx, cfg)
+            result["source_file"] = job["result"].get("source_file", "")
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+        with _jobs_lock:
+            _jobs[job_id] = {"status": "done", "result": result}
+    result["seq"] = seq
+    return jsonify(result)
+
+
 @app.route("/export/<job_id>", methods=["POST"])
 def export_pdf(job_id):
-    """Generate and return PDF report for a job."""
+    """Generate the Footprint Analysis Report from the explicitly selected frame(s) only."""
     with _jobs_lock:
         job = _jobs.get(job_id)
 
@@ -161,18 +198,47 @@ def export_pdf(job_id):
 
     data = request.get_json() or {}
     speed = data.get("speed", job["result"].get("speed", 0))
-    canvas_data = data.get("canvas_data", "")  # Base64 PNG from frontend
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        speed = 0.0
 
     try:
-        pdf_bytes = generate_report_pdf(job["result"], speed, canvas_data)
+        selected = [int(f) for f in (data.get("frames") or [])]
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid frame selection"}), 400
+    selected = list(dict.fromkeys(selected))      # unique, order preserved
+    if not selected:
+        return jsonify({"error": "Select at least one frame for the report"}), 400
+    if len(selected) > 3:
+        return jsonify({"error": "A report can use at most 3 frames"}), 400
+    valid = set(job["result"]["frame_numbers"])
+    missing = [f for f in selected if f not in valid]
+    if missing:
+        return jsonify({"error": f"Frame(s) not available: {missing}"}), 400
+
+    try:
+        pdf_bytes = generate_report_pdf(job["result"], speed, selected)
         return send_file(
             io.BytesIO(pdf_bytes),
             mimetype="application/pdf",
             as_attachment=True,
-            download_name=f"Apollo_TyreWear_Analysis_{int(speed)}kmph_Report.pdf"
+            download_name=f"Apollo_Footprint_Analysis_Report_{int(speed)}kmph.pdf"
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+def _decode_pixel_data(pd: dict) -> dict:
+    """Expand base64 typed buffers in pixel_data back into plain Python lists."""
+    import numpy as np
+    if pd.get("encoding") != "b64":
+        return pd
+    out = {k: v for k, v in pd.items() if k not in ("_dtypes", "encoding")}
+    for name, dt in pd.get("_dtypes", {}).items():
+        raw = pd.get(name) or ""
+        out[name] = np.frombuffer(base64.b64decode(raw), dtype=np.dtype(dt)).tolist() if raw else []
+    return out
+
 
 @app.route("/pixel/<job_id>", methods=["POST"])
 def pixel_inspector(job_id):
@@ -195,6 +261,7 @@ def pixel_inspector(job_id):
     pixel_data = result.get("pixel_data")
     if not pixel_data:
         return jsonify({"error": "Pixel data not available"}), 404
+    pixel_data = _decode_pixel_data(pixel_data)
 
     # The pixel_data stores flat arrays.
     cols = pixel_data.get("grid_cols", 256)
@@ -299,7 +366,7 @@ def _run_processing(
     speed: float,
     position: str,
     filename: str,
-    fft_keep_ratio: float,
+    filters: dict,
 ):
     try:
         # ── [XSN-DIAG] Upload traceability ────────────────────────────────
@@ -312,20 +379,23 @@ def _run_processing(
         print(f"[XSN-DIAG]   extension    : {ext}")
         print(f"[XSN-DIAG]   saved path   : {filepath}")
         print(f"[XSN-DIAG]   file size    : {fsize:,} bytes ({fsize / 1048576:.1f} MB)")
-        print(f"[XSN-DIAG]   calling      : processor.load_and_process()")
+        print(f"[XSN-DIAG]   calling      : processor.prepare_job() + run_pipeline()")
         print(f"[XSN-DIAG] ===========================================================")
         # -----------------------------------------------------------------
 
-        result = load_and_process(
+        ctx = prepare_job(
             filepath,
             tyre_type=tyre_type,
             min_pressure=min_pressure,
             max_pressure=max_pressure,
             speed=speed,
             position=position,
-            fft_keep_ratio=fft_keep_ratio,
         )
+        cfg = config_with_overrides(ctx["base_config"], filters)
+        result = run_pipeline(ctx, cfg)
         result["source_file"] = filename
+        with _jobs_lock:
+            _job_ctx[job_id] = ctx
 
         # -- [XSN-DIAG] Result summary -------------------------------------
         print(f"[XSN-DIAG] Processing complete for {filename}")
